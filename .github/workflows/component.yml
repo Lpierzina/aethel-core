@@ -48,17 +48,61 @@ jobs:
       - name: The component must validate and expose the declared world
         run: |
           wasm-tools validate build1.component.wasm
-          wasm-tools component wit build1.component.wasm > embedded.wit
-          # Every operation the world declares must appear in the artifact.
-          # (saap-prove / saap-verify on the old `attestation` interface were
-          # removed: superseded by saap-verify-presentation, see
-          # src/component.rs's module doc.)
-          for op in plp-project-at-context plp-prove-identity plp-verify \
-                    saap-verify-presentation verify-signature \
-                    htss-split htss-reconstruct; do
-            grep -q "$op" embedded.wit || { echo "MISSING from component: $op"; exit 1; }
-          done
-          grep -q "identity-error" embedded.wit || { echo "identity-error absent"; exit 1; }
+          python3 scripts/check-component-exports.py \
+            wit/aethel-core.wit build1.component.wasm
+
+      - name: The component export checker must test itself
+        run: python3 scripts/test_check_component_exports.py
+
+      - name: Negative control: credential.present must be rejected when missing
+        run: |
+          echo "Negative control: credential.present is intentionally missing."
+          echo "This guards resource-method coverage in the canonical export checker."
+          echo "Expected exports remain derived from the unchanged canonical WIT."
+          scratch=$(mktemp -d)
+          rmdir "$scratch"
+          git worktree add --detach "$scratch" HEAD
+          trap 'git worktree remove --force "$scratch" || rm -rf "$scratch"' EXIT
+          SCRATCH="$scratch" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          wit = Path(os.environ["SCRATCH"]) / "wit/aethel-core.wit"
+          source = wit.read_text(encoding="utf-8")
+          declaration = "    present: func(holder: borrow<master-identity>, tau: list<u8>, projection-randomness: list<u8>, disclosed: disclosure-attributes, blinding-randomness: list<u8>, presentation-randomness: list<u8>) -> result<saap-presentation, identity-error>;\n"
+          assert declaration in source, "negative-control declaration changed; update this control"
+          wit.write_text(source.replace(declaration, "", 1), encoding="utf-8")
+
+          component = Path(os.environ["SCRATCH"]) / "src/component.rs"
+          source = component.read_text(encoding="utf-8")
+          start = source.index("    fn present(\n")
+          open_brace = source.index("{", start)
+          depth = 0
+          for end in range(open_brace, len(source)):
+              if source[end] == "{":
+                  depth += 1
+              elif source[end] == "}":
+                  depth -= 1
+                  if depth == 0:
+                      component.write_text(source[:start] + source[end + 1 :], encoding="utf-8")
+                      break
+          else:
+              raise AssertionError("negative-control implementation method is unterminated")
+          PY
+          (
+            cd "$scratch"
+            cargo build --release --target wasm32-unknown-unknown \
+              --no-default-features --features component --locked
+            wasm-tools component new \
+              target/wasm32-unknown-unknown/release/aethel_core.wasm \
+              -o broken.component.wasm
+          )
+          if python3 scripts/check-component-exports.py \
+            wit/aethel-core.wit "$scratch/broken.component.wasm"; then
+            echo "ERROR: negative control passed despite credential.present being absent"
+            exit 1
+          fi
+          echo "Negative control correctly rejected the broken component."
 
       # Everything above this point is structural: it builds, it validates, it
       # exposes the declared world. None of that is "you can instantiate it and
