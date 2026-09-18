@@ -176,6 +176,7 @@ fn test_deterministic_context_matrix() {
 
 /// Verify that Shamir 3-of-5 secret sharing splits and reconstructs correctly.
 #[test]
+#[allow(deprecated)] // Characterizes compatibility with the legacy u64 sharing API.
 fn test_htss_secret_sharing_roundtrip() {
     let original_secret: u64 = 5_234_123;
     let seed: u64 = 0xdeadbeef_cafebabe;
@@ -200,6 +201,7 @@ fn test_htss_secret_sharing_roundtrip() {
 
 /// Verify that the 5D hypercube routes all 5 shares from node 0 to node 31.
 #[test]
+#[allow(deprecated)] // Characterizes compatibility with the legacy u64 sharing API.
 fn test_htss_hypercube_routing() {
     let network = HypercubeNetwork::new();
 

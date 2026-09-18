@@ -236,6 +236,7 @@ mod tests {
     // ── ThresholdNotMet: driven through SecretSharer::reconstruct_secret_checked ─
 
     #[test]
+    #[allow(deprecated)] // Exercises reconstruction validation with legacy-format shares.
     fn threshold_not_met_with_fewer_than_three_shares() {
         let shares = SecretSharer::split_secret(12_345u64, 3, 5, 0xdead_beef);
         let result = SecretSharer::reconstruct_secret_checked(&shares[0..2]);
@@ -243,6 +244,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Exercises reconstruction validation with legacy-format shares.
     fn reconstruct_secret_checked_succeeds_at_the_threshold() {
         let secret = 12_345u64;
         let shares = SecretSharer::split_secret(secret, 3, 5, 0xdead_beef);
