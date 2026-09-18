@@ -35,6 +35,51 @@ rather than as a flat array shuffle — but that deployment does not exist in th
 Treat "prevents metadata leakage," "eavesdropper," and "fault-tolerant delivery" as design targets
 for that future system, not properties of the code as it ships.
 
+### Who runs HTSS (A-3)
+
+> Gap this closes (SAGP-PG-001 A-3, verbatim): "HTSS / hypercube looks like
+> infrastructure 8gentz might host — Pulls us toward identity-as-a-service — HTSS is
+> the agent's or operator's backup ritual. 8gentz does not run the 32-node cube."
+
+**HTSS is a backup/recovery ritual performed by the agent's principal or an operator over
+the sealed identity's key material — it is not a hosted service, and nobody but that
+principal/operator ever runs it.** Concretely:
+
+- The 32-node, 80-edge hypercube in this document is a **routing model for how a principal
+  might distribute shares to custodians** — a schema for who-holds-what, not a running
+  network. Nothing in this crate opens a socket, and nothing described here implies a
+  server anyone operates on the agent's behalf.
+- **8gentz does not run the 32-node cube.** No SAGP component, fabric adapter, or hosted
+  gateway calls `SecretSharer::split_key_material`/`reconstruct_key_material` on an
+  agent's behalf. If a deployment ever needs a k-of-n shard of *operator* seeds (as
+  opposed to *agent identity* material), that belongs in operator runbooks built on this
+  module, not in a hosted `pqc-privacy::vault`-style service.
+- **What gets split is key material the caller already holds**, never a secret this crate
+  derives and keeps to itself. `htss-split`/`SecretSharer::split_key_material` take the
+  secret as a parameter; the crate never reaches into a `signing::Identity` or
+  `plp::MasterIdentity` to split it for you (there is no such method — see the resource
+  review in `src/component.rs`'s `secret-sharing` implementation notes). Whoever calls
+  `split` already had the material a caller had to supply; splitting emits nothing new.
+- **The ritual, end to end**: an agent's principal (or an operator acting for them) takes
+  the identity's *sealing key* (not the raw entropy — see
+  [`Identity::export_sealed`](../src/signing.rs)), splits it 3-of-5 with
+  `SecretSharer::split_key_material`, and distributes the five shares to five distinct
+  custodians along with the 32-bit root. Recovery is the reverse: gather 3 shares, feed
+  them plus the root to `SecretSharer::reconstruct_key_material` (or the WIT
+  `htss-reconstruct`), get back the sealing key, and `Identity::import_sealed` the
+  previously-sealed blob. This crate does not itself provide a single combined
+  `export_sealed_with_recovery` convenience method today (see the STATUS note below); a
+  caller composes the two documented primitives.
+
+**Status of a combined recovery API.** A single method that seals an identity and splits
+its sealing key in one call was proposed but is **not implemented** — closing this gap
+today is docs-first: the ritual above is fully expressible with the primitives that already
+ship (`export_sealed` + `SecretSharer::split_key_material`, and their inverses), so nothing
+about "HTSS is a backup ritual, not a hosted service" depends on a new API landing. If a
+combined convenience method is added later, it will be additive (a new WIT method on
+`master-identity`, mirrored natively), not a replacement for the two-step composition
+described here.
+
 ---
 
 ## 1. 5D Hypercube Topology

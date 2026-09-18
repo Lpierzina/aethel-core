@@ -7,22 +7,30 @@ project: "aethel-core"
 
 # Selective Attribute Attestation Protocol (SAAP) — Full Specification
 
-> **P3-05 (2026-08-26) editorial note.** §6 (Prove) and §7 (Verify) match the shipped
-> `saap_prove`/`verify_saap_proof` (`src/saap.rs`) closely: one masking vector, one challenge,
-> one response `z`. §2 (BDLOP commitment), §4, §5 (Issuance), §8 (the three-masking-vector
-> `y_r`/`y_s`/`y_m` protocol), §9 (three linked relations), and §10.2 are **not implemented** —
-> the shipped crate takes an already-parsed credential directly, does no BDLOP commitment of
-> its own, and produces a single response vector, not three. §12 (WASM memory footprint) is
-> marked aspirational — no such allocator or build constraint exists in the real build. §13.3
-> and §14.2 (HelixDB) are out of scope. "On-chain" phrasing (§1.3, §11.1) is fixed — this crate
-> has no blockchain component. Cross-check basis: `aethel-core`'s README, "What runs today vs.
-> what is designed."
+> **Status (2026-09-15, aethel-core 0.6.0).** This replaces the P3-05 editorial note of
+> 2026-08-26, which predated the credential module and had gone stale: it listed §2, §4, §5
+> and §8 as not implemented while those sections were labelled Implemented. The lists below
+> are checked against every section's own label by `tests/spec_status.rs`, so the two cannot
+> drift apart again without a failing test.
+>
+> - Implemented: §2, §4.2, §4.3, §5, §6, §7, §8, §9.1, §9.2
+> - Not implemented: §4.1, §4.4, §9.3, §10.2, §10.3, §10.4
+> - Aspirational: §12
+> - Out of scope: §13.3, §14.2
+>
+> **Implemented is not the same as sound.** The credential commitment (§2) is built exactly as
+> specified, and the specified shape does not hide: see `SECURITY.md` and §11.2. Where §7, §8
+> or §10 disagree with §6, §6 is what the crate runs. "On-chain" phrasing (§1.3, §11.1) was
+> removed in P3-05; this crate has no blockchain component.
+>
+> Every disagreement between this document, the RFC and the crate, with its ruling and owner,
+> is in [`DEVIATIONS.md`](./DEVIATIONS.md). That includes the ones closed on purpose.
 
 ## RFC Draft: Aethel-ID (AETHEL-SPEC-001) — Section 6
 
 Classical identity credentials (e.g., W3C Verifiable Credentials) rely on digital signatures over structured JSON-LD or JWT payloads. Verifying an attribute traditionally requires revealing the holder's public key or identifier alongside the signature, enabling verifiers to correlate identity state across multiple contexts.
 
-This section specifies the **Selective Attribute Attestation Protocol (SAAP)** for Aethel-ID. SAAP allows a Holder to prove arbitrary statements (e.g., membership, range bounds, predicate matching) about credential attributes without disclosing non-requested attributes, without exposing static identity identifiers, and without revealing the Issuer's signature object directly.
+This section specifies the **Selective Attribute Attestation Protocol (SAAP)** for Aethel-ID. SAAP allows a Holder to disclose a chosen subset of credential attributes without disclosing the rest, without exposing static identity identifiers, and without revealing the Issuer's signature object directly.
 
 ---
 
@@ -53,17 +61,20 @@ PROVING PHASE (Selective Disclosure):                     Holder Local Runtime
 ### 1.3 Security Goals
 
 1. **Zero Identifier Disclosure**: Neither the holder's master secret **s**, nor any persistent public key, nor the Issuer's raw signature object is transmitted or exposed by this crate's API.
-2. **Context-Isolated Unlinkability**: Because **r_blind** is freshly sampled for every verification session, two separate verifications of the exact same credential produce statistically independent commitments **t_blind^(1)** and **t_blind^(2)**, preventing cross-verifier collusive tracking.
+2. **Context-Isolated Unlinkability**: Because **r_blind** is freshly sampled for every verification session, two separate verifications of the exact same credential produce statistically independent commitments **t_blind^(1)** and **t_blind^(2)**, preventing cross-verifier collusive tracking. *Not achieved at the shipped parameters; see §11.2.*
 3. **Post-Quantum Soundness**: The extraction hardness of hidden attributes **m_hidden** from **t_blind** reduces directly to the hardness of the Module Short Integer Solution (M-SIS_{k,l,q}) and M-LWE_{k,l,q} problems over **R_q**.
 
 ---
 
 ## 2. Cryptographic Primitives: Lattice Commitment Scheme (BDLOP)
 
-**Implemented** in `src/credential.rs` (`IssuerParams`, `Credential::issue`).
+**Implemented** in `src/credential.rs` (`IssuerParams`, `Credential::issue`), with `T = 13` rows and `L = 4` columns, exactly the shape §2.2 specifies.
 
-> See the editorial note at the top of this document — the shipped `saap_prove` does not
-> construct a BDLOP commitment; it operates directly on caller-supplied credential bytes.
+> **The specified shape does not hide.** A BDLOP commitment hides only when its randomness
+> dimension exceeds its commitment dimension, and §2.2 specifies the reverse. This is recorded
+> in `SECURITY.md` and registered as D-01 in [`DEVIATIONS.md`](./DEVIATIONS.md). Correcting the
+> shape is tracked as separate credential work. Until it lands, treat a presentation as
+> revealing every attribute it commits to, disclosed or not.
 
 Attestation issuance uses a Module-Lattice Commitment Scheme derived from the **Baum-Dunkelman-Lyubashevsky-Orcioni-Pointcheval (BDLOP)** framework over **R_q = Z_q[X]/(X^N + 1)**.
 
@@ -122,15 +133,17 @@ Vectors failing this bound check MUST be rejected and re-sampled using fresh eph
 
 ## 4. Issuance & Blinding Mechanics
 
-**Implemented** in `src/credential.rs` (`Credential::issue`, `BlindedCredential::new`).
-
-> See the editorial note at the top of this document — no issuance or signing layer exists in the shipped crate.
+**Partially implemented.** Issuance and blinding are built (`Credential::issue`, `BlindedCredential::new`). The issuer signature (§4.1) and per-slot hidden commitments (§4.4) are not.
 
 ### 4.1 Issuer Signature
+
+**Not implemented.** No issuer signature is produced or checked, so disclosed attributes are self-asserted. `docs/ISSUER-AUTHENTICATION.md` states the gap and the construction that would close it.
 
 The Issuer signs the commitment **t_cred** using an ML-DSA / Dilithium signature **σ_Issuer**.
 
 ### 4.2 Holder Blinding
+
+**Implemented** in `BlindedCredential::new`, with `r_blind` sampled from CBD as below. Blinding a commitment that does not hide (§2) does not make presentations unlinkable (§11.2).
 
 Before presenting attributes to a Verifier for context **τ**, the Holder blinds **t_cred** using fresh randomness **r_blind ← χ_η^l**:
 
@@ -140,9 +153,13 @@ t_blind = t_cred + B_1 · r_blind  (mod q)
 
 ### 4.3 Attribute Selection Vector
 
+**Implemented**: the disclosed set is chosen per presentation. Slot 0, the identity binding, is never disclosable.
+
 Let **I_disclosed ⊂ {1,...,n}** be the index set of attributes selected for disclosure, and **I_hidden = {1,...,n} \ I_disclosed** be the hidden set.
 
 ### 4.4 Attribute Projection
+
+**Not implemented as written.** The built protocol keeps hidden slots inside `t_blind` and proves them through `z_m` (§6). There is no separate `B_2` and no per-slot commitment.
 
 The Holder splits **m** into public components **m_pub** (where **i ∈ I_disclosed**) and hidden commitments **C_hidden** (where **j ∈ I_hidden**):
 
@@ -154,32 +171,33 @@ C_j = B_{2,j} · r_blind + m_j  (mod q)  ∀j ∈ I_hidden
 
 ## 5. Issue Algorithm (SAAP.Issue)
 
-**Implemented** in `src/credential.rs` (`Credential::issue`).
+**Implemented** in `src/credential.rs` (`Credential::issue`). The block below is the algorithm the crate runs. It replaces the RFC's earlier issuance sketch, which §10.2 still carries for reference and which is not implemented.
 
-> See the editorial note at the top of this document.
+Issuance is a single local call. No context identifier is among its inputs, and it produces no issuer signature (§4.1). The commitment it produces does not hide (§2).
 
 ```
-Algorithm SAAP.Issue(sk_iss, A, ContextID):
-  Input:  Issuer secret key sk_iss
-          Attribute vector A = (a_1, ..., a_n) ∈ R_q^n
-          Context identifier ContextID ∈ {0,1}^256
-  Output: Credential tuple C_iss = (t_attr, A, ContextID, Σ_iss)
+Algorithm SAAP.Issue(issuer_params, s, attributes, issuance_randomness):
+  Input:  Issuer parameters: B_1 in R_q^(T x L), expanded from a public seed that is
+            derived one-way from the issuer seed (IssuerParams::from_seed)
+          Holder master secret s in R_q^k. Only s[0] is committed.
+          Attributes a_1..a_8, each a u64
+          Issuance randomness, at least 32 bytes
+  Output: Credential (t_cred, r, m), held by the holder
 
-  1. Sample public commitment matrix:
-     B ← R_q^(k × m)  deterministically from ContextID using SHAKE-256.
+  1. Messages, one ring element per slot:
+       m[0] = s[0]                       (identity binding, never disclosable)
+       m[i] = Encode(a_i), i = 1..8      (four 16-bit limbs per attribute)
 
-  2. Sample small-norm commitment error vector:
-     e_commit $<- (CBD_η)^k
+  2. Commitment randomness, one short polynomial per column of B_1:
+       r[j] <- CBD_eta, from SHAKE-256 over "AETHEL_SAAP_ISSUE_R_V1",
+               the issuance randomness and j,        j = 0..L-1
 
-  3. Construct homomorphic attribute vector commitment:
-     t_attr = B * A + e_commit  (mod q)
+  3. Commit:
+       t_cred = B_1 * r + (0^L || m)  (mod q)
 
-  4. Sign message payload:
-     M_iss = (t_attr ∥ ContextID)
-     Σ_iss = (c_iss, z_iss) ← ML-DSA.Sign(sk_iss, M_iss)
+  4. Return (t_cred, r, m).
 
-  5. Output Credential Tuple:
-     C_iss = (t_attr, A, ContextID, Σ_iss)
+  Shipped parameters: L = 4, T = L + 9 = 13.
 ```
 
 ---
@@ -281,6 +299,12 @@ how a sigma protocol leaks the secret the check was protecting.
 
 ## 7. Verify Algorithm (SAAP.Verify)
 
+**Implemented** as `saap-verify-presentation` in the WIT world.
+
+> The block below is the RFC's sketch. Where it and §6 differ, §6 is what the crate verifies
+> against: the identity relation carries `z_e` (§6.1), attribute slots of `z_m` carry no norm
+> bound (§6.2), and there is no predicate step (§9.3).
+
 ```
 Algorithm SAAP.Verify(τ, t_blind, m_pub, b_τ, π_SAAP):
   Input:  Session context τ
@@ -317,8 +341,8 @@ Algorithm SAAP.Verify(τ, t_blind, m_pub, b_τ, π_SAAP):
 
 **Implemented** end to end for issuance, blinding, proving and verification. The predicate step is not. See section 9.3.
 
-> See the editorial note at the top of this document — the shipped protocol uses a single
-> masking vector / response, not the three (`y_r`, `y_s`, `y_m`) shown below.
+> The sketch below omits the error-term mask `y_e` and response `z_e` that the built protocol
+> carries (§6.1). §6 is authoritative.
 
 ```
 Prover P                                                               Verifier V
@@ -341,11 +365,11 @@ Prover P                                                               Verifier 
 
 **Two of three implemented.** Identity linkage and credential membership are built and tested; predicate satisfaction is not. See section 9.3.
 
-> See the editorial note at the top of this document.
-
 To prove possession of a valid credential containing attributes satisfying predicate **P(m_hidden)** under context **τ**, the Holder generates a Zero-Knowledge proof **π_SAAP** consisting of three linked relations:
 
 ### 9.1 Identity Linkage Relation
+
+**Implemented** in `credential::prove` (§6), sharing the mask `y_s` with slot 0 of the credential relation.
 
 Proves knowledge of the master state vector **s** corresponding to the context-bound Polymorphic Lattice Projection:
 
@@ -354,6 +378,8 @@ b_τ = A_τ · s + e_τ  (mod q)
 ```
 
 ### 9.2 Credential Membership Relation
+
+**Implemented** in `credential::prove` (§6).
 
 Proves knowledge of short randomness vectors **r, e*** and hidden message polynomial vector **m_hidden** such that:
 
@@ -368,7 +394,16 @@ t_blind - (0 ∥ m_pub) = B_1 · r* + (0 ∥ m_hidden)  (mod q)
 > stubbed, so that no caller can mistake an unevaluated predicate for a satisfied
 > one. **A verifier cannot currently learn "age >= 21" from a SAAP presentation.**
 > Selective disclosure of whole attributes works; predicates over hidden
-> attributes do not. Tracked as follow-on work to 0X3-79.
+> attributes do not.
+
+> **This relation cannot be built inside this protocol.** The design below is
+> retained because it is what the relation would have to look like, not because
+> it is buildable here. Bit-ness is a quadratic constraint and this is a linear
+> sigma protocol; the verification relation holds only modulo `q` and is
+> therefore vacuous about 64-bit values; and shortness of a masked response
+> bounds `c * w` rather than `w`. See
+> [`PREDICATE-PROOFS.md`](./PREDICATE-PROOFS.md) for the full argument, what a
+> passing proof does establish, and the two options that remain.
 
 The design, for when it is built. For hidden numerical attributes (e.g., Age >= 21),
 the prover proves in ZK that:
@@ -396,7 +431,7 @@ A deterministic, side-channel resistant execution mechanism that filters candida
 
 ### 10.2 SAAP.Issue Algorithm (IETF Format)
 
-> See the editorial note at the top of this document.
+**Not implemented.** This is the RFC's earlier issuance sketch, kept for reference. §5 is the algorithm the crate runs.
 
 ```
 Algorithm:
@@ -411,6 +446,8 @@ Algorithm:
 ```
 
 ### 10.3 SAAP.Prove Algorithm (IETF Format)
+
+**Not implemented.** This describes the single-response pathway in `src/saap.rs`, which is crate-internal and was removed from the WIT world in 0.1.5. §6 is the algorithm the crate runs.
 
 ```
 Algorithm:
@@ -435,6 +472,8 @@ Algorithm:
 ```
 
 ### 10.4 SAAP.Verify Algorithm (IETF Format)
+
+**Not implemented.** The verifier for the §10.3 pathway, likewise retired. §7 and §6 describe what the crate verifies.
 
 ```
 Algorithm:
@@ -465,6 +504,13 @@ Neither the holder's master secret **s**, nor any persistent public key, nor the
 
 Because **r_blind** is freshly sampled for every verification session, two separate verifications of the exact same credential produce statistically independent commitments **t_blind^(1)** and **t_blind^(2)**, preventing cross-verifier collusive tracking.
 
+**Status.** Not achieved at the shipped parameters. `B_1` is specified in §7 with a
+randomness dimension smaller than its commitment dimension, and the crate implements
+that shape. A BDLOP commitment hides only when the relationship runs the other way, so
+`t_blind` is not a hiding commitment and re-randomising it per session does not make
+two presentations unlinkable. Correcting the specified shape is tracked; until it
+lands, treat this as a design goal rather than a property.
+
 ### 11.3 Post-Quantum Soundness
 
 The extraction hardness of hidden attributes **m_hidden** from **t_blind** reduces directly to the hardness of the Module Short Integer Solution (M-SIS_{k,l,q}) and M-LWE_{k,l,q} problems over **R_q**.
@@ -483,15 +529,25 @@ qualifications remain, and neither is covered by the theorem:
 
 Two distinct SAAP proof transcripts generated from the same underlying attribute commitment **t_attr** using different session nonces **τ_1** and **τ_2** MUST be computationally indistinguishable from random elements in **R_q**.
 
+**Status.** Required, not achieved. This rests on §11.2, which does not hold at the
+shipped commitment shape.
+
 ### 11.5 Zero-Knowledge Disclosure
 
 The SAAP proof protocol leaks strictly zero information regarding undisclosed attributes.
+
+**Status.** Required, not achieved. The masking of undisclosed attributes inside the
+proof is sound: §6.2 explains why attribute masks are uniform over `R_q` rather than
+short, and that reasoning holds. What does not hold is the surrounding claim, because
+`t_blind` itself travels with the presentation and is not a hiding commitment at the
+specified dimensions. Undisclosed attribute values are therefore not protected by the
+commitment, independently of how well the proof masks them.
 
 ---
 
 ## 12. WebAssembly Memory Footprint and Enclave Execution Bounds
 
-> **Aspirational — no allocator or build constraint in this repo enforces this.** See the editorial note at the top of this document.
+> **Aspirational — no allocator or build constraint in this repo enforces this.** See the status note at the top of this document.
 
 ### 12.1 Linear Memory Layout and Bounded Allocation
 
@@ -546,6 +602,9 @@ The SAAP proof protocol leaks strictly zero information regarding undisclosed at
 
 1. **Presentation Unlinkability**: Two distinct SAAP proof transcripts generated from the same underlying attribute commitment **t_attr** using different session nonces **τ_1** and **τ_2** MUST be computationally indistinguishable from random elements in **R_q**.
 2. **Zero-Knowledge Disclosure**: The SAAP proof protocol leaks strictly zero information regarding undisclosed attributes.
+
+**Status.** Both are requirements this document sets, and neither is met at the shipped
+commitment shape. See §11.4 and §11.5.
 
 ### 14.2 Graph-Topological Privacy and Trajectory Protection
 

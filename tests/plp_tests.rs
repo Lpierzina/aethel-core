@@ -48,11 +48,14 @@ fn test_identifier_generation() {
     let proj = identity.project_at_context(tau, &[0xa5u8; 32]);
 
     // Public projection b_τ should be non-zero
-    let b_all_zero = proj.public_b.coeffs().iter().all(|&c| c == 0);
+    let b_all_zero = proj.public_b.iter().all(|p| p.coeffs().iter().all(|&c| c == 0));
     assert!(!b_all_zero, "Public projection b_τ should not be all-zero");
 
     // Context matrix A_τ should be non-zero
-    let a_all_zero = proj.matrix_a.coeffs().iter().all(|&c| c == 0);
+    let a_all_zero = proj
+        .matrix_a
+        .iter()
+        .all(|row| row.iter().all(|p| p.coeffs().iter().all(|&c| c == 0)));
     assert!(!a_all_zero, "Context matrix A_τ should not be all-zero");
 }
 
@@ -67,7 +70,7 @@ fn test_proof_generation_and_verification() {
         .expect("honest proving must not exhaust rejection sampling");
 
     // Proof response norm should be within rejection bound
-    let norm = proof.response_z.infinity_norm();
+    let norm = aethel_core::plp::vec_infinity_norm(&proof.response_z);
     assert!(
         norm < (131_072 - 78),
         "Response norm {} should be < GAMMA1 - BETA = {}",
@@ -92,12 +95,10 @@ fn test_cross_context_unlinkability() {
     let proj_2 = identity.project_at_context(b"context_1001", &[0xa5u8; 32]);
 
     // The two public projections should differ
-    let projections_equal = proj_1
-        .public_b
-        .coeffs()
-        .iter()
-        .zip(proj_2.public_b.coeffs().iter())
-        .all(|(a, b)| a == b);
+    let flat_b = |p: &aethel_core::plp::EphemeralProjection| {
+        p.public_b.iter().flat_map(|q| q.coeffs().to_vec()).collect::<Vec<u32>>()
+    };
+    let projections_equal = flat_b(&proj_1) == flat_b(&proj_2);
 
     assert!(
         !projections_equal,
@@ -105,12 +106,13 @@ fn test_cross_context_unlinkability() {
     );
 
     // The two context matrices should differ
-    let matrices_equal = proj_1
-        .matrix_a
-        .coeffs()
-        .iter()
-        .zip(proj_2.matrix_a.coeffs().iter())
-        .all(|(a, b)| a == b);
+    let flat_a = |p: &aethel_core::plp::EphemeralProjection| {
+        p.matrix_a
+            .iter()
+            .flat_map(|row| row.iter().flat_map(|q| q.coeffs().to_vec()))
+            .collect::<Vec<u32>>()
+    };
+    let matrices_equal = flat_a(&proj_1) == flat_a(&proj_2);
 
     assert!(
         !matrices_equal,
@@ -156,12 +158,13 @@ fn test_deterministic_context_matrix() {
     let proj_b = identity.project_at_context(tau, &[0xa5u8; 32]);
 
     // A_τ must be identical for the same context
-    let matrices_equal = proj_a
-        .matrix_a
-        .coeffs()
-        .iter()
-        .zip(proj_b.matrix_a.coeffs().iter())
-        .all(|(a, b)| a == b);
+    let flat_a = |p: &aethel_core::plp::EphemeralProjection| {
+        p.matrix_a
+            .iter()
+            .flat_map(|row| row.iter().flat_map(|q| q.coeffs().to_vec()))
+            .collect::<Vec<u32>>()
+    };
+    let matrices_equal = flat_a(&proj_a) == flat_a(&proj_b);
 
     assert!(
         matrices_equal,
@@ -355,7 +358,7 @@ fn test_proof_norm_bounds_satisfied() {
         let proof = Prover::prove_identity(&identity, &proj, &seed)
             .expect("honest proving must not exhaust rejection sampling");
 
-        let norm = proof.response_z.infinity_norm();
+        let norm = aethel_core::plp::vec_infinity_norm(&proof.response_z);
         assert!(
             norm < (131_072 - 78),
             "Proof {} response norm {} should be < GAMMA1 - BETA = {}",

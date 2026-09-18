@@ -79,7 +79,7 @@ In this system:
 ### Projection Generation
 
 ```
-Context Expansion:  A_τ ← SHAKE-256("AETHEL_PLP_CTX_V1" ∥ τ)
+Context Expansion:  A_τ ← SHAKE-256("AETHEL_PLP_CTX_V3" ∥ τ ∥ salt)
 Noise Sampling:     e_τ ← χ_η^k over R_q
 Projection:         b_τ = A_τ · s + e_τ (mod q)
 ```
@@ -97,9 +97,13 @@ Under the hardness of M-LWE_{k,η,q}, the projection **b_τ** is computationally
 ## SAAP Protocol Flow (Issue → Prove → Verify)
 
 > **Partially shipped.** The Prove/Verify algorithms below match the shipped `saap_prove`/
-> `verify_saap_proof`. The Issuance phase (BDLOP commitment issuance, an issuer ML-DSA
-> signature) is design-only — the shipped crate takes an already-parsed credential directly,
-> with no issuance or signing layer.
+> `verify_saap_proof`, and BDLOP commitment issuance is shipped as `credential.issue`. The
+> issuer ML-DSA signature is design-only, and cannot be built in the form drawn below: the
+> verifier sees the blinded commitment, never `t_cred`, so a signature over `t_cred` can be
+> neither shown nor checked without reintroducing a static per-credential identifier and
+> destroying unlinkability. Closing this needs a signature the holder proves knowledge of in
+> zero knowledge. See [ISSUER-AUTHENTICATION.md](ISSUER-AUTHENTICATION.md) for the gap, the
+> construction, and what it assumes until then.
 
 The **Selective Attribute Attestation Protocol (SAAP)** allows a Holder to prove arbitrary statements about credential attributes without disclosing non-requested attributes, without exposing static identity identifiers, and without revealing the Issuer's signature object directly.
 

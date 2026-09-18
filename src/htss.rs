@@ -30,6 +30,21 @@
 //! fault tolerance against real node failures, or metadata protection as a
 //! design target for that future system, not a property of the code here.
 //!
+//! ## Who runs this (A-3)
+//!
+//! **HTSS is a backup/recovery ritual performed by the agent's principal or an
+//! operator over the sealed identity's key material — it is not a hosted
+//! service.** 8gentz does not run the 32-node cube; the hypercube here is a
+//! routing *model* for how a principal might distribute shares to distinct
+//! custodians, not a network anyone operates on the agent's behalf. What
+//! [`SecretSharer::split_key_material`] splits is material the caller already
+//! holds (typically an [`crate::signing::Identity`]'s sealing key, never the
+//! raw entropy) — this module never reaches into an identity and splits it
+//! unasked. See [`docs/HTSS-TOPOLOGY.md`](../docs/HTSS-TOPOLOGY.md)'s "Who runs
+//! HTSS" section for the full ritual (seal → split → distribute → reconstruct
+//! → import) and its current status: doc-first, composed from the primitives
+//! already shipping here rather than a new combined API.
+//!
 //! ## Key Structures
 //!
 //! - [`NodeAddress`] — 5-bit hypercube node coordinate (a modeled graph vertex)
@@ -71,16 +86,19 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use sha3::{digest::{ExtendableOutput, XofReader}, Digest, Sha3_256, Shake256};
+use sha3::{
+    digest::{ExtendableOutput, XofReader},
+    Digest, Sha3_256, Shake256,
+};
 use zeroize::Zeroize;
 
 use crate::identity_error::IdentityError;
 
 const HYPERCUBE_DIM: usize = 5;
 const NUM_NODES: usize = 1 << HYPERCUBE_DIM; // 2^5 = 32 nodes
-const THRESHOLD_K: usize = 3;                 // 3-of-5 threshold scheme
+const THRESHOLD_K: usize = 3; // 3-of-5 threshold scheme
 const MODULUS_Q: u64 = 8380417;
-const TOTAL_SHARES: usize = 5;                // n in the 3-of-5 scheme
+const TOTAL_SHARES: usize = 5; // n in the 3-of-5 scheme
 
 /// A 5-bit hypercube node coordinate (0..31).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -285,11 +303,11 @@ fn build_share_tree(leaves: &[[u8; 32]; TOTAL_SHARES]) -> ([u8; 32], [Vec<u8>; T
     };
 
     let paths = [
-        flat(&[l1, n23, l4]),   // index 1: sibling leaf, sibling subtree, far leaf
-        flat(&[l0, n23, l4]),   // index 2
-        flat(&[l3, n01, l4]),   // index 3
-        flat(&[l2, n01, l4]),   // index 4
-        flat(&[n0123]),         // index 5: one level, straight off the root
+        flat(&[l1, n23, l4]), // index 1: sibling leaf, sibling subtree, far leaf
+        flat(&[l0, n23, l4]), // index 2
+        flat(&[l3, n01, l4]), // index 3
+        flat(&[l2, n01, l4]), // index 4
+        flat(&[n0123]),       // index 5: one level, straight off the root
     ];
 
     (root, paths)
@@ -432,9 +450,7 @@ impl SecretSharer {
             let mut coefficients = Vec::with_capacity(THRESHOLD_K);
             coefficients.push(limb_value % MODULUS_Q);
             for coeff_idx in 1..THRESHOLD_K {
-                coefficients.push(Self::derive_coeff_from_key(
-                    &coeff_key, limb_idx, coeff_idx,
-                ));
+                coefficients.push(Self::derive_coeff_from_key(&coeff_key, limb_idx, coeff_idx));
             }
 
             for share in shares.iter_mut() {
@@ -528,7 +544,10 @@ impl SecretSharer {
         if width == 0 || width % LIMB_EVAL_BYTES != 0 {
             return Err(IdentityError::SerializationError);
         }
-        if shares.iter().any(|s| s.value.len() != width || s.index == 0) {
+        if shares
+            .iter()
+            .any(|s| s.value.len() != width || s.index == 0)
+        {
             return Err(IdentityError::SerializationError);
         }
 
@@ -613,10 +632,7 @@ impl SecretSharer {
     /// non-Rust caller parses, so it needs to be reachable and tested by
     /// ordinary native tests rather than only by building for a specific
     /// target.
-    pub fn split_key_material_bytes(
-        secret: &[u8],
-        nonce: &[u8],
-    ) -> Result<Vec<u8>, IdentityError> {
+    pub fn split_key_material_bytes(secret: &[u8], nonce: &[u8]) -> Result<Vec<u8>, IdentityError> {
         let (shares, root) = Self::split_key_material(secret, nonce)?;
         let width = shares[0].value.len();
 
@@ -894,15 +910,25 @@ impl SecretSharer {
     /// the failing case unreachable. This is the second line, so a future caller
     /// that does reach it gets an error rather than a plausible number.
     fn mod_inverse(a: i64, m: i64) -> Option<i64> {
-        let mut t = 0i64; let mut newt = 1i64;
-        let mut r = m; let mut newr = a % m;
+        let mut t = 0i64;
+        let mut newt = 1i64;
+        let mut r = m;
+        let mut newr = a % m;
         while newr != 0 {
             let quotient = r / newr;
-            let temp_t = t - quotient * newt; t = newt; newt = temp_t;
-            let temp_r = r - quotient * newr; r = newr; newr = temp_r;
+            let temp_t = t - quotient * newt;
+            t = newt;
+            newt = temp_t;
+            let temp_r = r - quotient * newr;
+            r = newr;
+            newr = temp_r;
         }
-        if r > 1 { return None; }
-        if t < 0 { t += m; }
+        if r > 1 {
+            return None;
+        }
+        if t < 0 {
+            t += m;
+        }
         Some(t)
     }
 }
@@ -1007,8 +1033,13 @@ mod tests {
     fn mod_inverse_still_inverts() {
         let q = MODULUS_Q as i64;
         for a in [1i64, 2, 3, 7, 1234, q - 1] {
-            let inv = SecretSharer::mod_inverse(a, q).expect("a non-zero residue mod a prime is invertible");
-            assert_eq!((a * inv).rem_euclid(q), 1, "mod_inverse({a}) is not an inverse");
+            let inv = SecretSharer::mod_inverse(a, q)
+                .expect("a non-zero residue mod a prime is invertible");
+            assert_eq!(
+                (a * inv).rem_euclid(q),
+                1,
+                "mod_inverse({a}) is not an inverse"
+            );
         }
     }
 
@@ -1091,7 +1122,12 @@ mod tests {
         // Corrupted root, everything else genuine.
         let mut tampered_root = root;
         tampered_root[0] ^= 0x01;
-        assert!(!verify_share_in_tree(index, &value, &paths[1], &tampered_root));
+        assert!(!verify_share_in_tree(
+            index,
+            &value,
+            &paths[1],
+            &tampered_root
+        ));
     }
 
     /// Index 0 and index 6 are outside the scheme; a path of any length must

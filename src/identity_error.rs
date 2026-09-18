@@ -21,8 +21,8 @@
 //! needs all 16 rejection-sampling iterations to fail, which is negligible for
 //! honest parameters. It is exercised natively instead.
 
-use crate::sampling::RejectionError;
 use crate::saap::SaapValidationError;
+use crate::sampling::RejectionError;
 
 /// Closed set of failure reasons across all `aethel:core` WIT operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +76,43 @@ pub enum IdentityError {
     /// carrying either does not reconstruct to the shared secret, so it must
     /// not reconstruct at all.
     InvalidShareSet,
+
+    // ── A-4: `aethel-plp-1` wire envelope (native-only, no WIT producer) ────
+    //
+    // These four are new in 0.6.0 and reachable only through `wire::{decode_projection,
+    // decode_proof, verify_projection}` and the raw struct codecs
+    // (`EphemeralProjection::from_bytes` / `ZkIdentityProof::from_bytes`) they build
+    // on. None of them has a WIT producer: `wit/aethel-core.wit`'s `identity-error`
+    // variant is unchanged (adding a case there would be a breaking ordinal shift
+    // for every existing importer), so `component.rs`'s `From<IdentityError> for
+    // WitError` collapses all four to `WitError::SerializationError` at the
+    // component boundary — the same fold the RESERVED variants above already use,
+    // just in the other direction (many native causes, one WIT effect, rather than
+    // one native cause with several WIT-side reservations).
+    //
+    // Kept distinct on the native side because "wrong magic", "wrong version",
+    // "declared length disagrees with what's actually there", and "a coefficient
+    // isn't a member of R_q" are different failures with different fixes for a
+    // native caller debugging a bad wire payload, even though a WASM component
+    // caller sees one undifferentiated `serialization-error`.
+    /// An `aethel-plp-1` envelope's magic bytes did not match
+    /// [`crate::EIAB_MAGIC`].
+    WireBadMagic,
+    /// An `aethel-plp-1` envelope declared a version byte this build does not
+    /// recognize. See `wire::WIRE_VERSION_PLP1`.
+    WireBadVersion,
+    /// An `aethel-plp-1` envelope was too short to contain its header, or its
+    /// declared body length did not match the number of bytes actually
+    /// present after the header.
+    WireLengthMismatch,
+    /// A decoded polynomial coefficient was `>= Q`, i.e. not a member of
+    /// `R_q = Z_q[X]/(X^N + 1)`. Raised by [`crate::plp::EphemeralProjection::from_bytes`]
+    /// and [`crate::plp::ZkIdentityProof::from_bytes`] before any arithmetic
+    /// ever touches the value — `add_mod`/`sub_mod` assume reduced inputs, so
+    /// admitting an out-of-range coefficient would be a robustness defect
+    /// even though the Fiat-Shamir challenge recomputation means it is not,
+    /// by itself, a soundness break.
+    CoefficientOutOfRange,
 }
 
 impl From<SaapValidationError> for IdentityError {
@@ -178,8 +215,22 @@ mod tests {
         let decoded =
             EphemeralProjection::from_bytes(&bytes).expect("well-formed bytes must decode");
         assert_eq!(decoded.tau, projection.tau);
-        assert_eq!(decoded.matrix_a.coeffs, projection.matrix_a.coeffs);
-        assert_eq!(decoded.public_b.coeffs, projection.public_b.coeffs);
+        // Compare the whole rank-k matrix and vector. Checking one cell would
+        // let a codec that dropped the other components round-trip cleanly.
+        let flat_a = |p: &EphemeralProjection| {
+            p.matrix_a
+                .iter()
+                .flat_map(|row| row.iter().flat_map(|q| q.coeffs().to_vec()))
+                .collect::<alloc::vec::Vec<u32>>()
+        };
+        let flat_b = |p: &EphemeralProjection| {
+            p.public_b
+                .iter()
+                .flat_map(|q| q.coeffs().to_vec())
+                .collect::<alloc::vec::Vec<u32>>()
+        };
+        assert_eq!(flat_a(&decoded), flat_a(&projection));
+        assert_eq!(flat_b(&decoded), flat_b(&projection));
     }
 
     // ── ThresholdNotMet: driven through SecretSharer::reconstruct_secret_checked ─

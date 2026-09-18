@@ -54,14 +54,15 @@ wit_bindgen::generate!({
     world: "aethel-core",
 });
 
+use aethel::core::types::IdentityError as WitError;
 use exports::aethel::core::identity::{
     Credential as WitCredential, DisclosureAttributes, EphemeralProjection as WitProjection,
-    Guest as IdentityGuest, GuestCredential, GuestMasterIdentity,
+    Guest as IdentityGuest, GuestCredential, GuestIssuerPublicParameters, GuestMasterIdentity,
+    IssuerPublicParameters as WitIssuerPublicParameters, IssuerPublicParametersBorrow,
     MasterIdentity as WitMasterIdentity, MasterIdentityBorrow,
     SaapPresentation as WitSaapPresentation, ZkIdentityProof as WitZkProof,
 };
 use exports::aethel::core::secret_sharing::{Guest as SecretSharingGuest, HtssShare as WitShare};
-use aethel::core::types::IdentityError as WitError;
 
 use crate::identity_error::IdentityError;
 use crate::{credential, htss, plp, signing};
@@ -96,6 +97,15 @@ impl From<IdentityError> for WitError {
             IdentityError::InvalidAttributeCommitment => WitError::InvalidAttributeCommitment,
             IdentityError::ThresholdNotMet => WitError::ThresholdNotMet,
             IdentityError::InvalidShareSet => WitError::InvalidShareSet,
+            // A-4: the `aethel-plp-1` wire codec's four native-only variants
+            // have no WIT producer and collapse to `serialization-error`
+            // here — see their doc comments in `identity_error.rs` for why
+            // `identity-error`'s variant ordinals stay unchanged rather than
+            // growing a matching case.
+            IdentityError::WireBadMagic => WitError::SerializationError,
+            IdentityError::WireBadVersion => WitError::SerializationError,
+            IdentityError::WireLengthMismatch => WitError::SerializationError,
+            IdentityError::CoefficientOutOfRange => WitError::SerializationError,
         }
     }
 }
@@ -132,7 +142,7 @@ impl IdentityGuest for Component {
         Ok(WitProjection {
             tau: proj.tau.to_vec(),
             salt: proj.salt.to_vec(),
-            public_b: proj.public_b.coeffs().to_vec(),
+            public_b: vec_to_coeffs(&proj.public_b),
         })
     }
 
@@ -158,16 +168,13 @@ impl IdentityGuest for Component {
         let proof = plp::Prover::prove_identity(&identity, &proj, &seed)?;
 
         Ok(WitZkProof {
-            commitment_w: proof.commitment_w.coeffs().to_vec(),
+            commitment_w: vec_to_coeffs(&proof.commitment_w),
             challenge_c: proof.challenge_c.coeffs().to_vec(),
-            response_z: proof.response_z.coeffs().to_vec(),
+            response_z: vec_to_coeffs(&proof.response_z),
         })
     }
 
-    fn plp_verify(
-        projection: WitProjection,
-        proof: WitZkProof,
-    ) -> Result<bool, WitError> {
+    fn plp_verify(projection: WitProjection, proof: WitZkProof) -> Result<bool, WitError> {
         let proj = projection_from_wit(&projection)?;
         let zk = zk_proof_from_wit(&proof)?;
 
@@ -179,9 +186,10 @@ impl IdentityGuest for Component {
 
     type MasterIdentity = OwnedIdentity;
     type Credential = OwnedCredential;
+    type IssuerPublicParameters = OwnedIssuerParams;
 
     fn saap_verify_presentation(
-        issuer_seed: Vec<u8>,
+        issuer: IssuerPublicParametersBorrow<'_>,
         presentation: WitSaapPresentation,
         projection: WitProjection,
         tau: Vec<u8>,
@@ -213,12 +221,12 @@ impl IdentityGuest for Component {
             challenge: credential::unflatten::<1>(&presentation.challenge)?[0],
             z_r: credential::unflatten::<{ credential::CRED_L }>(&presentation.z_r)?,
             z_m: credential::unflatten::<{ credential::CRED_SLOTS }>(&presentation.z_m)?,
-            z_s: credential::unflatten::<1>(&presentation.z_s)?[0],
-            z_e: credential::unflatten::<1>(&presentation.z_e)?[0],
+            z_s: credential::unflatten::<{ plp::MODULE_K }>(&presentation.z_s)?,
+            z_e: credential::unflatten::<{ plp::MODULE_K }>(&presentation.z_e)?,
         };
 
-        let params = credential::IssuerParams::from_seed(&issuer_seed);
-        credential::verify(&params, &native, &t_blind, &proj, &tau).map_err(Into::into)
+        let params = &issuer.get::<OwnedIssuerParams>().0;
+        credential::verify(params, &native, &t_blind, &proj, &tau).map_err(Into::into)
     }
 
     fn verify_signature(
@@ -227,6 +235,41 @@ impl IdentityGuest for Component {
         signature: Vec<u8>,
     ) -> Result<bool, WitError> {
         signing::verify(&public_key, &message, &signature).map_err(Into::into)
+    }
+
+    /// A-4: verify from `aethel-plp-1` wire bytes, binding the verifier's
+    /// own context. Delegates entirely to `crate::wire::verify_projection`
+    /// so the component and native paths share one implementation.
+    fn plp_verify_bytes(
+        projection: Vec<u8>,
+        proof: Vec<u8>,
+        context: Vec<u8>,
+    ) -> Result<bool, WitError> {
+        crate::wire::verify_projection(&projection, &proof, &context).map_err(Into::into)
+    }
+
+    /// A-4: encode a typed projection as `aethel-plp-1` wire bytes.
+    ///
+    /// No `WitError` in this signature (see the WIT doc comment for why):
+    /// a malformed record — `tau`/`salt` not exactly 32 bytes, or `public-b`
+    /// not exactly `MODULE_K * RING_N` coefficients or carrying an
+    /// out-of-range coefficient — encodes to an empty `Vec`, which
+    /// `plp-verify-bytes`/`wire::decode_projection` is guaranteed to reject
+    /// on length rather than silently accepting truncated data.
+    fn encode_projection(projection: WitProjection) -> Vec<u8> {
+        match projection_from_wit(&projection) {
+            Ok(proj) => crate::wire::encode_projection(&proj),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// A-4: encode a typed proof as `aethel-plp-1` wire bytes. See
+    /// [`Self::encode_projection`] for why this has no `WitError`.
+    fn encode_proof(proof: WitZkProof) -> Vec<u8> {
+        match zk_proof_from_wit(&proof) {
+            Ok(zk) => crate::wire::encode_proof(&zk),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
@@ -258,18 +301,16 @@ impl GuestMasterIdentity for OwnedIdentity {
         tau: Vec<u8>,
         randomness: Vec<u8>,
     ) -> Result<WitProjection, WitError> {
-        // Same bound as the free function: short randomness collapses the
-        // projection to an exact linear image of the secret.
-        if randomness.len() < 32 {
-            return Err(WitError::InvalidInputLength);
-        }
-        let identity = plp::MasterIdentity::from_seed(self.0.plp_seed());
-        let proj = identity.project_at_context(&tau, &randomness);
+        // Delegates to `signing::Identity::project_at_context` (A-1) so the
+        // component and native paths share one derivation instead of two
+        // that happen to agree. The length bound on `randomness` is enforced
+        // there.
+        let proj = self.0.project_at_context(&tau, &randomness)?;
 
         Ok(WitProjection {
             tau: proj.tau.to_vec(),
             salt: proj.salt.to_vec(),
-            public_b: proj.public_b.coeffs().to_vec(),
+            public_b: vec_to_coeffs(&proj.public_b),
         })
     }
 
@@ -283,26 +324,72 @@ impl GuestMasterIdentity for OwnedIdentity {
     }
 
     fn prove(&self, tau: Vec<u8>, randomness: Vec<u8>) -> Result<WitZkProof, WitError> {
-        if randomness.len() < 32 {
-            return Err(WitError::InvalidInputLength);
-        }
-        let seed = self.0.plp_seed();
-        let identity = plp::MasterIdentity::from_seed(seed);
-        // Same randomness as the projection at this tau. See `plp_prove_identity`.
-        let proj = identity.project_at_context(&tau, &randomness);
-        let proof = plp::Prover::prove_identity(&identity, &proj, seed)?;
+        // Delegates to `signing::Identity::prove` (A-1) — same randomness as
+        // the projection at this tau, enforced there. See `plp_prove_identity`
+        // for why the randomness must match.
+        let proof = self.0.prove(&tau, &randomness)?;
 
         Ok(WitZkProof {
-            commitment_w: proof.commitment_w.coeffs().to_vec(),
+            commitment_w: vec_to_coeffs(&proof.commitment_w),
             challenge_c: proof.challenge_c.coeffs().to_vec(),
-            response_z: proof.response_z.coeffs().to_vec(),
+            response_z: vec_to_coeffs(&proof.response_z),
         })
     }
 }
 
+/// Flatten a rank-`k` vector into the `list<u32>` the WIT records carry.
+///
+/// Component order, low index first. The WIT type is unchanged by the module
+/// rank: only the list length moves, from `RING_N` to `MODULE_K * RING_N`.
+fn vec_to_coeffs(v: &plp::PolyVec) -> alloc::vec::Vec<u32> {
+    let mut out = alloc::vec::Vec::with_capacity(plp::MODULE_K * crate::RING_N);
+    for poly in v.iter() {
+        out.extend_from_slice(poly.coeffs());
+    }
+    out
+}
+
+/// Parse a `list<u32>` back into a rank-`k` vector.
+///
+/// The length check is exact. A caller handing over a rank-1 list, which is what
+/// every projection published before the rank change looks like, is rejected
+/// rather than zero-extended into a projection that would then fail to verify
+/// for an unexplained reason.
+///
+/// **Range-checked (A-4).** Every coefficient must be `< Q`. This used to
+/// copy `u32`s straight into a `Poly` with no such check; `add_mod`/`sub_mod`
+/// (`plp.rs`) assume reduced inputs, so an out-of-range coefficient from an
+/// untrusted WIT caller produced undefined arithmetic — not a soundness
+/// break by itself, since the Fiat-Shamir challenge recomputation would
+/// still reject a forged transcript, but a robustness defect the new codec
+/// (`plp::EphemeralProjection::from_bytes` / `ZkIdentityProof::from_bytes`)
+/// must not inherit. This function now shares that same check.
+fn vec_from_coeffs(coeffs: &[u32]) -> Result<plp::PolyVec, WitError> {
+    if coeffs.len() != plp::MODULE_K * crate::RING_N {
+        return Err(WitError::SerializationError);
+    }
+    for &c in coeffs {
+        if c >= plp::Q {
+            return Err(WitError::SerializationError);
+        }
+    }
+    let mut out = [plp::Poly::zero(); plp::MODULE_K];
+    for (i, chunk) in coeffs.chunks(crate::RING_N).enumerate() {
+        out[i].coeffs.copy_from_slice(chunk);
+    }
+    Ok(out)
+}
+
+/// See [`vec_from_coeffs`]: same exact-length and `< Q` range checks, for a
+/// single ring element (the proof's `challenge-c`).
 fn poly_from_coeffs(coeffs: &[u32]) -> Result<plp::Poly, WitError> {
     if coeffs.len() != crate::RING_N {
         return Err(WitError::SerializationError);
+    }
+    for &c in coeffs {
+        if c >= plp::Q {
+            return Err(WitError::SerializationError);
+        }
     }
     let mut poly = plp::Poly::zero();
     poly.coeffs.copy_from_slice(coeffs);
@@ -327,15 +414,15 @@ fn projection_from_wit(p: &WitProjection) -> Result<plp::EphemeralProjection, Wi
         // Derived, not decoded. The wire carries no matrix, so there is no
         // inconsistent A for a caller to supply. See the record's doc comment.
         matrix_a: plp::derive_context_matrix(&tau, &salt),
-        public_b: poly_from_coeffs(&p.public_b)?,
+        public_b: vec_from_coeffs(&p.public_b)?,
     })
 }
 
 fn zk_proof_from_wit(p: &WitZkProof) -> Result<plp::ZkIdentityProof, WitError> {
     Ok(plp::ZkIdentityProof {
-        commitment_w: poly_from_coeffs(&p.commitment_w)?,
+        commitment_w: vec_from_coeffs(&p.commitment_w)?,
         challenge_c: poly_from_coeffs(&p.challenge_c)?,
-        response_z: poly_from_coeffs(&p.response_z)?,
+        response_z: vec_from_coeffs(&p.response_z)?,
     })
 }
 
@@ -383,7 +470,8 @@ impl SecretSharingGuest for Component {
     /// `SecretSharer::reconstruct_key_material`'s doc comment for the exact
     /// trust boundary.
     fn htss_split(secret: Vec<u8>) -> Result<(Vec<WitShare>, Vec<u8>), WitError> {
-        let (shares, root) = htss::SecretSharer::split_key_material(&secret, COMPONENT_SPLIT_NONCE)?;
+        let (shares, root) =
+            htss::SecretSharer::split_key_material(&secret, COMPONENT_SPLIT_NONCE)?;
         let wit_shares = shares
             .into_iter()
             .map(|s| WitShare {
@@ -410,7 +498,9 @@ impl SecretSharingGuest for Component {
                 path: s.path,
             })
             .collect();
-        Ok(htss::SecretSharer::reconstruct_key_material(&native, &root_arr)?)
+        Ok(htss::SecretSharer::reconstruct_key_material(
+            &native, &root_arr,
+        )?)
     }
 }
 
@@ -423,12 +513,15 @@ export!(Component);
 /// and it returns disclosed values, a fresh blinded commitment and the
 /// responses, none of which is key material.
 ///
-/// The issuer seed is kept alongside the credential because presenting needs
-/// the same `B_1` the credential was issued under, and asking the caller to
-/// supply it again on every presentation would be one more thing to get wrong.
+/// The issuer's **public** parameters are kept alongside the credential because
+/// presenting needs the same `B_1` the credential was issued under, and asking
+/// the caller to supply it again on every presentation would be one more thing
+/// to get wrong. The seed is not kept: it is consumed at issuance and dropped,
+/// so a holder's runtime does not sit on the issuing secret for the lifetime of
+/// the credential. It used to.
 pub struct OwnedCredential {
     credential: credential::Credential,
-    issuer_seed: Vec<u8>,
+    params: credential::IssuerParams,
 }
 
 impl GuestCredential for OwnedCredential {
@@ -445,11 +538,14 @@ impl GuestCredential for OwnedCredential {
         values.copy_from_slice(&attributes);
 
         let identity = plp::MasterIdentity::from_seed(holder.get::<OwnedIdentity>().0.plp_seed());
-        let params = credential::IssuerParams::from_seed(&issuer_seed);
+        let params = credential::IssuerParams::from_seed(&issuer_seed)?;
         let cred =
             credential::Credential::issue(&params, &identity, &values, &issuance_randomness)?;
 
-        Ok(WitCredential::new(OwnedCredential { credential: cred, issuer_seed }))
+        Ok(WitCredential::new(OwnedCredential {
+            credential: cred,
+            params,
+        }))
     }
 
     fn present(
@@ -468,12 +564,14 @@ impl GuestCredential for OwnedCredential {
         let identity = plp::MasterIdentity::from_seed(holder.get::<OwnedIdentity>().0.plp_seed());
         let projection = identity.project_at_context(&tau, &projection_randomness);
 
-        let params = credential::IssuerParams::from_seed(&self.issuer_seed);
-        let blinded =
-            credential::BlindedCredential::new(&params, &self.credential, &blinding_randomness)?;
+        let blinded = credential::BlindedCredential::new(
+            &self.params,
+            &self.credential,
+            &blinding_randomness,
+        )?;
 
         let presentation = credential::prove(
-            &params,
+            &self.params,
             &blinded,
             &identity,
             &projection,
@@ -491,8 +589,36 @@ impl GuestCredential for OwnedCredential {
             challenge: presentation.challenge.coeffs.to_vec(),
             z_r: credential::flatten(&presentation.z_r),
             z_m: credential::flatten(&presentation.z_m),
-            z_s: presentation.z_s.coeffs.to_vec(),
-            z_e: presentation.z_e.coeffs.to_vec(),
+            z_s: credential::flatten(&presentation.z_s),
+            z_e: credential::flatten(&presentation.z_e),
         })
+    }
+}
+
+/// The component-side owner of a [`credential::IssuerParams`].
+///
+/// A resource rather than a record so that the only way to obtain one is to
+/// derive it from a seed or to deserialise published bytes. A record of raw
+/// bytes would be structurally interchangeable with the seed, which is the
+/// confusion this type exists to prevent.
+pub struct OwnedIssuerParams(credential::IssuerParams);
+
+impl GuestIssuerPublicParameters for OwnedIssuerParams {
+    fn derive(issuer_seed: Vec<u8>) -> Result<WitIssuerPublicParameters, WitError> {
+        let params = credential::IssuerParams::from_seed(&issuer_seed)?;
+        Ok(WitIssuerPublicParameters::new(OwnedIssuerParams(params)))
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        self.0.public_seed().to_vec()
+    }
+
+    fn deserialize(bytes: Vec<u8>) -> Result<WitIssuerPublicParameters, WitError> {
+        let seed: [u8; credential::PUBLIC_SEED_BYTES] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| WitError::InvalidInputLength)?;
+        let params = credential::IssuerParams::from_public_seed(&seed);
+        Ok(WitIssuerPublicParameters::new(OwnedIssuerParams(params)))
     }
 }

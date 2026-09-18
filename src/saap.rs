@@ -245,7 +245,10 @@ pub fn verify_response_norm(z: &VectorK) -> u32 {
 
 /// Derive a sparse ternary challenge polynomial from an XOF reader.
 ///
-/// Produces exactly 60 ±1 coefficients using rejection sampling.
+/// Produces exactly [`crate::plp::CHALLENGE_WEIGHT`] coefficients in `{±1}`
+/// using rejection sampling. The weight is shared with `plp` deliberately:
+/// `BETA` is derived from it, and two challenge spaces with one bound would
+/// mean the bound is wrong for at least one of them.
 pub fn hash_to_challenge_from_xof(xof: &mut impl XofReader) -> Polynomial {
     let mut c_poly = Polynomial::zero();
 
@@ -257,7 +260,7 @@ pub fn hash_to_challenge_from_xof(xof: &mut impl XofReader) -> Polynomial {
     let mut used = [false; RING_N];
     let mut pos_buf = [0u8; 1];
 
-    while count < 60 {
+    while count < crate::plp::CHALLENGE_WEIGHT {
         xof.read(&mut pos_buf);
         let pos = pos_buf[0] as usize;
         if pos >= RING_N {
@@ -745,7 +748,10 @@ mod tests {
         let w = VectorK::zero();
         let c = recompute_challenge(&w, b"tau", 0u64, &AttributePayload::zero());
         let nonzero = c.coeffs.iter().filter(|&&x| x != 0).count();
-        assert_eq!(nonzero, 60, "challenge should have exactly 60 non-zero coefficients");
+        assert_eq!(
+            nonzero, crate::plp::CHALLENGE_WEIGHT,
+            "challenge should have exactly CHALLENGE_WEIGHT non-zero coefficients"
+        );
     }
 
     #[test]
@@ -896,7 +902,7 @@ mod soundness_tests {
 
         // Same free choices as the SAAP forgery: zero commitment, zero response,
         // challenge recomputed the way the verifier will recompute it.
-        let commitment_w = Poly::zero();
+        let commitment_w = [Poly::zero(); crate::plp::MODULE_K];
         let challenge_c = crate::plp::hash_to_challenge(
             &commitment_w,
             &projection.public_b,
@@ -906,7 +912,7 @@ mod soundness_tests {
         let proof = ZkIdentityProof {
             commitment_w,
             challenge_c,
-            response_z: Poly::zero(),
+            response_z: [Poly::zero(); crate::plp::MODULE_K],
         };
 
         assert!(

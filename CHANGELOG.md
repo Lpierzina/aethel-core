@@ -7,6 +7,273 @@ adheres to the breaking-change and deprecation rules in
 [`STABILITY.md`](./STABILITY.md) rather than strict SemVer prior to `1.0.0` — see that
 document for what counts as breaking inside `0.x`.
 
+## [0.6.0] - 2026-09-10
+
+Closes the aethel-core portion of the SAGP-PG-001 primitive-gap-remediation plan (A-1
+through A-5, X-2, X-3). See `aethel-docs/plan/PRIMITIVE-GAP-REMEDIATION.md` §2 for the
+full gap-by-gap rationale; this entry lists the resulting public-API surface.
+
+### Added
+
+- **`signing::Identity::project_at_context`/`prove` (A-1).** The native bridge from a
+  `signing::Identity` to a PLP projection/proof, mirroring the WIT `master-identity`
+  resource's `project-at-context`/`prove` methods. Previously the only route from an
+  `Identity` to `plp` was the crate-private `plp_seed()`, reachable only from
+  `component.rs`; a native "load identity, present to a verifier" flow could not be
+  written without holding two unrelated secrets. `component.rs`'s `OwnedIdentity` now
+  delegates to these methods instead of duplicating the derivation.
+- **`signing::Identity::sign_with_purpose` / `signing::verify_with_purpose` (A-1 / X-2).**
+  Purpose-separated (domain-separated) signing via FIPS 204's native `ctx` mechanism
+  (`pqc_sig::MlDsa65Keypair::sign_ctx_deterministic`/`verify_ctx`). A signature made under
+  one purpose does not verify under another, nor under plain `sign`/`verify` for a
+  non-empty purpose; an empty purpose is byte-identical to plain `sign`/`verify`.
+- **`signing::purpose` registry (A-1 / X-2).** Pinned context-string constants:
+  `PLP_PRESENT_V1`, `CREDENTIAL_V1`, `SAAP_V1` for this crate's own operations, and
+  `VAULT_SPEND_INTENT_V1`, `VAULT_SETTLEMENT_RECEIPT_V1`, `VAULT_WALLET_BIND_V1`,
+  `VAULT_HITL_APPROVAL_V1` reserved on aethel-vault's behalf. See `docs/PURPOSES.md`.
+- **`examples/present_to_verifier.rs` (A-1).** A ~40-line, network-free, end-to-end demo:
+  generate an identity, derive a projection + proof, sign an attach challenge under a
+  purpose, and verify everything from bytes only. Run with
+  `cargo run --example present_to_verifier`.
+- **`wire` module — the `aethel-plp-1` versioned wire envelope (A-4).**
+  `wire::{encode_projection, decode_projection, encode_proof, decode_proof}` and the public
+  entry point the gap analysis names:
+  `wire::verify_projection(projection: &[u8], proof: &[u8], context: &[u8]) -> Result<bool, IdentityError>`.
+  Envelope: `magic(4, = EIAB_MAGIC) ‖ version(1) ‖ kind(1) ‖ body_len(4, LE) ‖ body`. See
+  `docs/WIRE-FORMAT.md` for the normative spec.
+- **`plp::ZkIdentityProof::{to_bytes, from_bytes}` (A-4).** A proof previously had no byte
+  codec at all (`ZK_IDENTITY_PROOF_BYTE_LEN` new). Decode-then-validate: exact length,
+  every coefficient `< Q`, and `challenge_c` must be ternary with exactly
+  `CHALLENGE_WEIGHT` non-zero coefficients.
+- **WIT (additive): `plp-verify-bytes`, `encode-projection`, `encode-proof`.** Appended to
+  `interface identity` in `wit/aethel-core.wit`; does not change `identity-error`'s variant
+  ordinals. Implemented in `component.rs` by delegating to `wire::verify_projection`/
+  `wire::{encode_projection,encode_proof}`.
+- **`IdentityError` gained four native-only variants (A-4):** `WireBadMagic`,
+  `WireBadVersion`, `WireLengthMismatch`, `CoefficientOutOfRange`. None has a WIT producer
+  — `component.rs`'s `From<IdentityError> for WitError` collapses all four to
+  `WitError::SerializationError`, so the WIT `identity-error` variant is unchanged.
+- **`tests/vectors/aethel-plp-1/` (A-5 / X-4).** Checked-in, deterministically-generated
+  hex test vectors (`valid-1`, `valid-2`, `tampered-projection`, `tampered-proof`,
+  `wrong-context`) plus `tests/plp_vectors.rs` (native loader/verifier, and the
+  `#[ignore]`d `regenerate_vectors`) and two new tests in `tests/component_execution.rs`
+  that drive the identical files through the component's `plp-verify-bytes`. This is the
+  "sagp-host (native) and agent SDKs (wasm) agree" proof: one set of files, two runtimes.
+- **`docs/PURPOSES.md` (X-2)** and **`docs/WIRE-FORMAT.md` (A-4)** — new normative/reference
+  docs; see their contents for detail. `docs/PLP-ALGORITHM.md` gained §9 (PLP vs
+  `did:pkh:eip155`, A-2) and `docs/HTSS-TOPOLOGY.md` / `src/htss.rs` gained a "Who runs
+  HTSS" section (A-3): HTSS is a principal/operator backup ritual, not a hosted service.
+
+### Changed (BREAKING)
+
+- **`sampling::{PlpProof, RejectionError, VectorK}` no longer re-exported at the crate
+  root.** These are the enclave sampler's internal types; re-exporting them mixed sampler
+  internals into the public verify surface, which A-4 closes. Still reachable at
+  `aethel_core::sampling::*`.
+- **`EphemeralProjection::from_bytes` is stricter.** Length check changed from `>=` to
+  exact equality, and every `public_b` coefficient is now checked `< Q`
+  (`IdentityError::CoefficientOutOfRange` on violation) before any arithmetic touches it.
+  Previously accepted over-long buffers and unranged coefficients.
+- **`plp::pad_tau` is now `pub`** (was `pub(crate)`) — needed so `wire::verify_projection`
+  can compute the padded context form outside the `plp` module boundary.
+- **`component.rs`'s `vec_from_coeffs`/`poly_from_coeffs` now range-check `< Q`.**
+  Previously copied `u32` coefficients from an untrusted WIT caller straight into a `Poly`
+  with no check; `add_mod`/`sub_mod` assume reduced inputs. Not a soundness break by
+  itself (the Fiat-Shamir challenge recomputation still rejects a forged transcript), but
+  a robustness defect the new byte codecs must not inherit.
+- **`lib.rs`'s stale feature-flag doc corrected.** The `wasm` feature and `puf_enroll`/
+  `puf_reconstruct` WASM exports described there no longer exist (retired in 0.1.5 / P3-13);
+  the doc now describes `component` and the current `puf` feature accurately.
+- **`signing::Identity` and `signing::verify` now re-exported at the crate root**
+  (`pub use signing::{Identity, verify, verify_with_purpose};`), alongside
+  `pub use wire::verify_projection;`.
+
+### Security
+
+- No change to the cryptographic construction itself in this release; A-4's range checks
+  and exact-length decoding harden the *codec* boundary against malformed/adversarial
+  input without altering `Prover`/`Verifier`'s math.
+
+## [0.5.0] - 2026-09-08
+
+### Security
+
+- **Recorded three limitations in the shipped identity and credential paths.**
+  A cryptographic review of the `plp` and `credential` modules completed on
+  2026-09-08. The projection operates at module rank 1 where the specification
+  requires 4, so the lattice-hardness argument written for the specified profile
+  does not apply to the shipped code. The credential commitment is specified with
+  a randomness dimension below its commitment dimension and therefore does not
+  provide the hiding property claimed for it, which means undisclosed attribute
+  values are not protected by the commitment and two presentations of one
+  credential are not unlinkable. The rejection-sampling bound `beta` corresponds
+  to a challenge of weight 39 while the implemented challenge has weight 60, so
+  the rejection-sampling argument does not carry as written, though measured
+  behaviour stays far from the bound. Full detail in
+  [`SECURITY.md`](./SECURITY.md#known-limitations).
+
+### Changed
+
+- **The PLP identity path now runs at module rank 4 (BREAKING).**
+  `AETHEL-SPEC-001` §3.2 sets `k = 4` for the profile this crate targets and §9.2
+  forbids going below it. The implementation ran at rank 1, so the hardness
+  argument in `SECURITY-PROOFS.md`, written for a secret dimension of 1024 and a
+  BKZ block size of 400, did not describe the shipped code. The master secret,
+  context matrix, projection, error term, commitment and response are now
+  rank-4 module elements, sourced from `plp::MODULE_K`.
+
+  The rank is a single constant and every operation is generic in it, so moving
+  to LEVEL3 or LEVEL5 is a parameter change rather than a rewrite.
+
+  Three domain separators move, because the objects they derive are no longer the
+  same shape: `AETHEL_PLP_CTX_V2` to `V3`, `AETHEL_PLP_CHALLENGE_V3` to `V4`, and
+  `AETHEL_ERROR_V2` to `V3`. The WIT record types are unchanged, since
+  `public-b`, `commitment-w` and `response-z` were already `list<u32>` and only
+  their length moves. A projection or proof produced by `0.4.0` is rejected on
+  length rather than silently zero-extended. There is no migration path:
+  regenerate identities.
+
+  Measured over 500 identity proofs and 200 credential presentations, no honest
+  prover exhausted its rejection-sampling budget, so the existing iteration
+  ceilings absorb the lower per-iteration acceptance rate that four times as many
+  coefficients implies.
+
+- **The Fiat-Shamir challenge weight is now derived, not asserted (BREAKING).**
+  The challenge carried 60 non-zero coefficients while `β = 78` is the value for a
+  weight-39 challenge against a CBD(η=2) witness. The rejection-sampling argument
+  needs `β` to bound the infinity norm of the challenge times the witness, and at
+  weight 60 the worst case is 120, so `SECURITY-PROOFS.md` §7.4 did not carry.
+  Measured behaviour stayed far from the bound, so the practical leakage was
+  negligible, but every extraction bound stated elsewhere depends on the true
+  value.
+
+  The weight is now 39 (`plp::CHALLENGE_WEIGHT`), shared between `plp` and `saap`
+  so one bound cannot serve two challenge spaces. That makes the parameter set
+  exactly the profile the specification defines rather than a mixture of two
+  ML-DSA profiles, at no cost in proof size. The relationship
+  `BETA >= CHALLENGE_WEIGHT * ETA` is asserted at compile time, so the drift
+  cannot recur silently.
+
+- **Rejection-sampling ceilings raised to match the module rank.**
+  Rank 4 doubled the short responses in a credential presentation, from 6
+  polynomials to 12, so 3072 coefficients must now clear `γ₁ - β`. That accepts
+  about 16% of the time, and the previous 32 attempts left roughly 1 honest
+  presentation in 270 failing outright. The credential ceiling is now 192,
+  putting exhaustion at about 2e-15; the identity ceiling moves from 16 to 48,
+  from about 1 in 280,000 to about 5e-17. Expected attempts are 6 and 2
+  respectively, so typical latency is unchanged and only the tail moves. Both
+  scale with the rank and are documented as needing revisiting if it changes.
+
+  `γ₁` deliberately stays at 2^17. Moving it to 2^19 would have restored the rate
+  with the old ceilings, but it would take the parameter set off the specified
+  profile and widen every extracted bound by four times against `q/2 ≈ 2^22`.
+
+- **The credential challenge and masks now bind the whole statement (BREAKING).**
+  `derive_challenge` absorbed neither the per-projection salt that determines
+  `A_τ` nor the issuer public seed that determines `B_1`, so both matrices were
+  bound to the transcript only through the verification equations. That is the
+  weak Fiat-Shamir pattern `plp` corrected earlier and the correction had not
+  reached `credential`. Both are now absorbed, and `AETHEL_SAAP_CHALLENGE_V2`
+  becomes `V3`.
+
+  Presentation masks derived from `presentation_randomness`, a tag, the iteration
+  nonce and the slot index only. Two presentations that reused the randomness
+  therefore shared `y_s`, and subtracting the responses gave `(c₁ − c₂)·s`, which
+  recovers the master secret. Masks now absorb the context, the blinded
+  commitment, the projection, the disclosure set and the disclosed values, so
+  reuse is harmless rather than catastrophic. `AETHEL_SAAP_PROOF_MASK_V1` becomes
+  `V2`. This changes what a prover produces and not what a verifier checks, so it
+  is not itself a wire change.
+
+- **Corrected published claims to match the implementation.** The README's
+  parameter table stated a module rank of 4, and two domain separators that the
+  code had already moved past. `docs/SAAP-SPEC.md` asserted context-isolated
+  unlinkability, presentation unlinkability and zero-knowledge disclosure without
+  qualification. Each now records whether it is achieved at the shipped
+  parameters or remains a requirement the implementation does not yet meet.
+
+## [0.4.0] - 2026-09-06
+
+### Changed
+
+- **Verification no longer takes the issuer's secret (BREAKING).**
+  `saap-verify-presentation` took `issuer-seed`, the same value
+  `credential.issue` takes. Every party able to verify a presentation therefore
+  held the authority to issue credentials that would verify under the same
+  issuer, so an issuer could not let a third party verify, a verifier could not
+  be a public endpoint, and issuer and verifier could not be separate
+  organisations. Two independent readers found this from the published
+  documentation alone during blind testing of the Rust SDK.
+
+  The issuer's public parameters are now a distinct type in the world,
+  `issuer-public-parameters`, derived from the seed and carrying no part of it.
+  `saap-verify-presentation` takes those. `credential.issue` continues to take
+  the seed, as it must. There is no seed-taking verification entry point left,
+  deliberately: keeping one would leave the wrong wiring available to anyone who
+  reached for the familiar signature.
+
+  Public parameters serialise to 32 bytes, round-trip through `deserialize`, and
+  are safe to publish: the seed is hashed through SHAKE-256 to produce them, so
+  recovering it is a preimage search. What they do and do not grant is stated on
+  the type itself, including the limit. The verification relation checks a short
+  opening under `B_1`, not issuer authorisation, so these parameters separate the
+  verifying role from the issuing role but are not on their own a forgery
+  barrier. `docs/ISSUER-AUTHENTICATION.md` is new and states that gap and the
+  construction that closes it.
+
+  **Migration:** derive the parameters once and hold them, instead of passing the
+  seed per call.
+
+  ```rust
+  // before
+  let ok = identity::saap_verify_presentation(&issuer_seed, &presentation, &projection, tau)?;
+
+  // after
+  let issuer = IssuerPublicParameters::derive(&issuer_seed)?;   // issuing side, once
+  let published = issuer.serialize();                            // 32 bytes, publish this
+
+  let issuer = IssuerPublicParameters::deserialize(&published)?; // verifying side, once
+  let ok = identity::saap_verify_presentation(&issuer, &presentation, &projection, tau)?;
+  ```
+
+  A verifier that only ever holds `published` cannot issue. A presentation
+  verifies against parameters derived from the seed it was issued under and
+  against no other issuer's, asserted by test on both sides of the component
+  boundary.
+
+- **An issuer seed must be at least 32 bytes.** It is secret key material and now
+  carries the same floor as the rest of this world's secrets. `credential.issue`
+  and `issuer-public-parameters.derive` both return `invalid-input-length` for a
+  shorter one. Previously any length was accepted, including empty.
+
+- **`B_1` is expanded from the issuer's public seed rather than the issuer seed
+  (BREAKING at the wire level).** Interposing the public seed is what gives the
+  parameters a compact publishable form; expanding straight from the issuer seed
+  left the seed as the only short representation of `B_1`, so handing a verifier
+  something it could pin meant handing it the issuing secret. Credentials issued
+  under a previous version do not verify under this one and must be reissued.
+
+### Security
+
+- **A credential resource no longer retains the issuer seed.** It kept the seed
+  for the lifetime of the handle so that `present` could re-expand `B_1`, which
+  left the issuing secret sitting in the holder's runtime after issuance. It now
+  keeps the derived public parameters instead, and the seed is dropped once
+  issuance is done.
+
+### Fixed
+
+- `component.sha256` updated to
+  `5fee03ee725d32da4949d8d0769dc48fe2f68d5b664b33bdd928a889b7f50dd4`. The reshaped world and
+  the version string both move the compiled component's bytes. Verified byte-identical across
+  two independent builds in CI on the canonical platform.
+- **`pqc-sig` bumped from the yanked `0.3.0` to `0.3.1`.** `0.3.0` was yanked after 0.3.2
+  moved onto it, so the same `cargo-deny` advisories failure that fix addressed came back
+  from a different version. The requirement was already `0.3` and needed no change; only the
+  lockfile was pinned to the yanked release. `0.3.1` is currently the only unyanked version
+  of that crate. No source change: this crate uses `SigPublicKey`/`SigAlgorithm`/`Signature`/
+  `MlDsa65Keypair`, none of which changed.
+
 ## [0.3.2] - 2026-09-03
 
 ### Fixed

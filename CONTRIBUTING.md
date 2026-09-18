@@ -27,3 +27,21 @@ cargo test
 
 See [`README.md`](./README.md) for the full build matrix (WASM target, `puf` feature, etc.)
 and what's covered by the test suite.
+
+## Deviating from a specification
+
+This crate implements `AETHEL-SPEC-001` and [`docs/SAAP-SPEC.md`](./docs/SAAP-SPEC.md), and it
+does not always agree with them. Every disagreement lives in
+[`docs/DEVIATIONS.md`](./docs/DEVIATIONS.md): what the specification says, what the crate does,
+which one wins, and who owns it.
+
+**A change that makes the crate deviate from a specification adds its register row in the same
+pull request.** That applies whether the deviation is a fix to a specification defect or a
+decision to depart from it. A deviation found after merge is a defect in this process, not
+only in the code.
+
+- If the deviation is explained in a source comment headed `# Deviation from ...`, that comment
+  names its register row. `tests/deviations.rs` fails if it does not.
+- Deviations that are resolved with no action stay in the register, under **Closed**, with the
+  reason. A register that only lists open problems teaches the next reader to reopen the
+  closed ones.

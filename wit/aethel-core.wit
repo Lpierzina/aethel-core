@@ -215,6 +215,61 @@ interface identity {
     z-e: list<s32>,
   }
 
+  /// The public half of an issuer's key pair.
+  ///
+  /// An issuer's authority lives in its seed. This is everything a verifier
+  /// needs and nothing that lets it issue: `saap-verify-presentation` takes
+  /// these parameters, `credential.issue` takes the seed, and the two are
+  /// deliberately different types so a verifier cannot be wired to the wrong
+  /// half by accident.
+  ///
+  /// # What holding these grants
+  ///
+  /// Verification, and the ability to recognise which issuer a presentation was
+  /// made under. Deriving them from a seed is one-way: the seed is hashed
+  /// through SHAKE-256, so recovering it from the published bytes is a preimage
+  /// search. Holding these does not let you recover the seed.
+  ///
+  /// # What holding these does NOT grant
+  ///
+  /// These parameters leak nothing about the seed, and they do not let their
+  /// holder call `credential.issue`, which takes the seed. What they do not do
+  /// is make forgery hard for someone who does not go through this world.
+  ///
+  /// Issuance here is `t_cred = B_1 · r + (0 ‖ m)`, and the verification
+  /// relation checks that a presentation opens to a short preimage under `B_1`.
+  /// It does not check that an issuer authorised the attribute values. Anyone
+  /// holding these parameters can construct that opening with their own tooling
+  /// over their own identity, with attributes of their choosing, and it will
+  /// verify. The issuer's ML-DSA signature over the credential, which is what
+  /// would close this, is not shipped.
+  ///
+  /// So the separation these parameters buy is real but bounded: a verifier
+  /// that holds them gains no power to issue against anyone else's identity,
+  /// and a compromised verifier does not compromise the issuer. Holders are a
+  /// different matter, and a holder must hold these to present at all.
+  /// Deployments where holders are not trusted to self-assert their own
+  /// attributes need issuer-authenticated issuance. `docs/ISSUER-AUTHENTICATION.md`
+  /// states the gap and the construction that closes it.
+  resource issuer-public-parameters {
+    /// Derive the public parameters for the issuer identified by `issuer-seed`.
+    ///
+    /// `issuer-seed` MUST be at least 32 bytes. It is the issuer's secret and
+    /// does not leave with the result.
+    derive: static func(issuer-seed: list<u8>) -> result<issuer-public-parameters, identity-error>;
+
+    /// The published form, 32 bytes. This is what travels to every verifier and
+    /// what a relying party pins.
+    serialize: func() -> list<u8>;
+
+    /// Reconstruct published parameters. Round-trips with `serialize`.
+    ///
+    /// Every 32-byte string names some parameter set, so this rejects only a
+    /// wrong length. It cannot tell you that the bytes are the issuer you meant:
+    /// that is what pinning them over a trusted channel is for.
+    deserialize: static func(bytes: list<u8>) -> result<issuer-public-parameters, identity-error>;
+  }
+
   /// A credential issued over an identity.
   ///
   /// Holds the commitment randomness and the attribute values, so it is secret
@@ -227,6 +282,10 @@ interface identity {
     /// disclosable. It is what ties the credential to one identity: a
     /// presentation can only be produced by someone who also satisfies the
     /// identity-linkage relation for the same secret.
+    /// `issuer-seed` is the **secret** half of the issuer's key pair and MUST be
+    /// at least 32 bytes. Whoever holds it can issue credentials under this
+    /// issuer. It stays on the issuing side; a verifier takes
+    /// `issuer-public-parameters` instead, derived from this seed.
     issue: static func(holder: borrow<master-identity>, issuer-seed: list<u8>, attributes: list<u64>, issuance-randomness: list<u8>) -> result<credential, identity-error>;
 
     /// Produce a presentation disclosing the selected attributes.
@@ -245,7 +304,12 @@ interface identity {
   ///
   /// Returns `ok(false)` for a well-formed presentation that does not verify,
   /// and `err` only for input that cannot be processed.
-  saap-verify-presentation: func(issuer-seed: list<u8>, presentation: saap-presentation, projection: ephemeral-projection, tau: list<u8>) -> result<bool, identity-error>;
+  /// `issuer` is the **public** half of the issuer's key pair. Verification
+  /// needs no secret, so this function takes none: a public verifying endpoint
+  /// can hold these parameters in reachable memory, and issuer and verifier can
+  /// be separate organisations. There is no seed-taking verification entry
+  /// point, deliberately.
+  saap-verify-presentation: func(issuer: borrow<issuer-public-parameters>, presentation: saap-presentation, projection: ephemeral-projection, tau: list<u8>) -> result<bool, identity-error>;
 
   /// Verify an ML-DSA-65 signature.
   ///
@@ -256,6 +320,37 @@ interface identity {
   /// Returns `ok(false)` for a well-formed signature that does not verify, and
   /// `err` only for input that cannot be parsed.
   verify-signature: func(public-key: list<u8>, message: list<u8>, signature: list<u8>) -> result<bool, identity-error>;
+
+  /// Verify from `aethel-plp-1` wire bytes, binding the verifier's own
+  /// context (A-4).
+  ///
+  /// Decodes both the `projection` and `proof` `aethel-plp-1` envelopes
+  /// (native side: `aethel_core::wire::verify_projection`), then checks that
+  /// the decoded projection's `tau` matches the padded form of `context`
+  /// before running the same verification `plp-verify` does. This is the
+  /// entry point a host can call knowing only bytes — no `plp-project-at-context`
+  /// round trip, no hand-copied struct layout.
+  ///
+  /// Returns `ok(false)` for a well-formed but non-verifying pair, or one
+  /// made for a different context, and `err` only for undecodable input.
+  /// Additive: does not change `identity-error`'s variant ordinals.
+  plp-verify-bytes: func(projection: list<u8>, proof: list<u8>, context: list<u8>) -> result<bool, identity-error>;
+
+  /// Encode a typed `ephemeral-projection` as `aethel-plp-1` wire bytes, for
+  /// callers that relay bytes rather than the typed record (A-4).
+  ///
+  /// No `result` in this signature: encoding a well-formed record cannot
+  /// itself fail. A record whose `tau`/`salt` are not exactly 32 bytes, or
+  /// whose `public-b` is not exactly `MODULE_K * RING_N` coefficients — which
+  /// cannot happen to a record this world itself produced, only to one a
+  /// caller hand-built with the wrong shape — encodes to an empty byte
+  /// string, which is guaranteed to fail `plp-verify-bytes`/decode rather
+  /// than silently succeeding on truncated or padded data.
+  encode-projection: func(projection: ephemeral-projection) -> list<u8>;
+
+  /// Encode a typed `zk-identity-proof` as `aethel-plp-1` wire bytes. See
+  /// `encode-projection` for why this has no `result`.
+  encode-proof: func(proof: zk-identity-proof) -> list<u8>;
 }
 
 interface secret-sharing {

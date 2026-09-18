@@ -131,7 +131,7 @@ Algorithm Project(s, τ, rng):
   Output: Ephemeral projection (A_τ, b_τ)
 
   1. Context Expansion:
-     A_τ ← SHAKE-256("AETHEL_PLP_CTX_V1" ∥ τ)
+     A_τ ← SHAKE-256("AETHEL_PLP_CTX_V3" ∥ τ ∥ salt)
      (Expand to k×k matrix of uniform R_q elements)
 
   2. Noise Sampling:
@@ -232,7 +232,7 @@ Since **∥e_τ∥_∞ ≤ β** and **∥c∥_∞ ≤ 1** (sparse ternary), we h
 1. **Setup**: Challenger C samples master secret vector **s ← χ_η^k ⊂ R_q^k** with parameter set **λ = (N, q, k, η)**.
 
 2. **Phase 1 (Adaptive Context Queries)**: Adversary A adaptively chooses m distinct contexts **{τ_1, τ_2, ..., τ_m}**. For each context τ_i, C generates:
-   - **A_{τ_i} ← SHAKE-256("AETHEL_PLP_CTX_V1" ∥ τ_i)**
+   - **A_{τ_i} ← SHAKE-256("AETHEL_PLP_CTX_V3" ∥ τ_i ∥ salt_i)**
    - **e_{τ_i} ← χ_η^k**
    - **b_{τ_i} = A_{τ_i} · s + e_{τ_i} (mod q)**
    - C returns **(A_{τ_i}, b_{τ_i})** to A.
@@ -513,3 +513,72 @@ The following properties are targets for formal verification using Coq or Lean 4
 - NIST FIPS 204: "Module-Lattice-Based Digital Signature Standard (ML-DSA)." 2024.
 - Regev, O.: "On Lattices, Learning with Errors, Random Linear Codes, and Cryptography." STOC 2005.
 - Lyubashevsky, V., Peikert, C., Regev, O.: "On Ideal Lattices and Learning with Errors over Rings." EUROCRYPT 2010.
+
+---
+
+## 9. PLP vs `did:pkh:eip155` — two dialects, not two competitors (A-2)
+
+> Gap this closes (SAGP-PG-001 A-2, verbatim): "SAGP currently also speaks
+> did:pkh:eip155 — Two identity dialects on L0 — Wave 1: accept did:pkh for spend
+> binding (wallet is on Base) AND aethel projection for who. Document the pair. Do
+> not make PLP a Base address." Non-goal, verbatim (§10): "Do not make PLP replace
+> Base addresses for USDC. Spend rail stays eip155; identity stays aethel."
+
+A relying party (a fabric adapter, a gateway, a settlement counterparty) that talks to an
+aethel agent will see **two different identity dialects at layer 0**, and both are correct
+for what they each do:
+
+| Dialect | What it answers | Lifetime | Held by |
+|---|---|---|---|
+| **`did:pkh:eip155:8453:0x...`** | *"Where do I send/receive USDC?"* | Stable — a wallet address on Base | The agent's settlement signer (a classical secp256k1 key; see `aethel-vault`, a separate crate). |
+| **PLP projection (this document)** | *"Who is presenting right now?"* | Ephemeral — a fresh, unlinkable projection per context `τ` | The agent's [`signing::Identity`](../src/signing.rs) (ML-DSA-65 + PLP seed). |
+
+These are **not two ways of naming the same thing** — they answer different questions, for
+different reasons, with different lifetimes:
+
+- **Spend rail stays `eip155`.** USDC on Base is spent by a `transferWithAuthorization`
+  (EIP-3009) signed by a secp256k1 key at a stable address. A post-quantum ML-DSA
+  signature cannot be verified by that contract, and nothing in this crate changes that.
+  aethel-core has **no notion of an Ethereum address, chain id, or secp256k1 key at all** —
+  that machinery lives in `aethel-vault`, not here.
+- **Identity stays aethel.** A PLP projection `b_τ = A_τ·s + e_τ` is a fresh M-LWE sample
+  per context, computationally indistinguishable from uniform noise, and reusable for
+  exactly nothing beyond the context it was made for. It is the answer to "who is this,
+  cryptographically, right now" — not "where do I route a payment."
+
+### PLP is never a Base address
+
+Nothing in this crate encodes, hashes, or truncates a PLP projection into anything that
+looks like an Ethereum address (20 bytes, checksum-cased hex). `EphemeralProjection`'s wire
+form ([`docs/WIRE-FORMAT.md`](./WIRE-FORMAT.md)) is `tau(32) ‖ salt(32) ‖ public_b(...)` —
+structurally nothing like an address, and deliberately so. A relying party that needs "an
+address-shaped identifier" for a PLP holder has misread the primitive; the correct move is
+to keep the `did:pkh` binding for settlement and the PLP projection for identity, and pair
+them explicitly (next section) rather than collapsing one into the other.
+
+### The wire shape a relying party should accept
+
+A relying party pairing the two dialects for one interaction sees something shaped like:
+
+```text
+{ projection_bytes, proof_bytes, tau, spend_did, binding_sig }
+```
+
+- `projection_bytes` / `proof_bytes` — `aethel-plp-1` envelopes (this document, §7;
+  [`docs/WIRE-FORMAT.md`](./WIRE-FORMAT.md)), verified with
+  [`wire::verify_projection`](../src/wire.rs).
+- `tau` — the context the projection was made for; the verifier supplies this itself and
+  checks it against the decoded projection, never trusting a caller-supplied `tau`.
+- `spend_did` — the `did:pkh:eip155:8453:0x...` string naming the settlement address.
+- `binding_sig` — optional, out of scope for this crate: a signature over
+  `(projection_bytes, spend_did)` that ties a specific projection to a specific settlement
+  address for one interaction, without creating a stable, cross-context linkage between
+  them. Building this primitive (and whether it belongs in `aethel-core` or purely in
+  documentation/SAGP) is tracked as an open decision in the gap-remediation plan; nothing
+  in the shipped API depends on it existing.
+
+The acceptance half of this pairing — SAGP/a fabric adapter agreeing to hold both dialects
+side by side — is outside this crate's scope. What this document commits to is narrower and
+load-bearing: **aethel-core will never grow a feature that makes a PLP projection stand in
+for a Base address**, and any future spend-binding primitive will be additive, not a
+replacement for either dialect.

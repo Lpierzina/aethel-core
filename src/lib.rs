@@ -38,12 +38,14 @@
 //! ## Feature Flags
 //!
 //! - `std` (default): Standard library support, heap allocation.
-//! - `wasm`: WebAssembly target with `wasm-bindgen` bindings.
+//! - `component`: Builds the WebAssembly Component Model adapter (`src/component.rs`)
+//!   implementing the `aethel:core` WIT world. This is the only WebAssembly surface; a
+//!   `wasm-bindgen` cdylib used to sit alongside it and was retired (see the note at the
+//!   bottom of this file).
 //! - `enclave`: Enables constant-time enclave execution paths and volatile zeroization.
-//! - `puf` (research, non-default): Compiles the `puf` module and its `puf_enroll` /
-//!   `puf_reconstruct` WASM exports. SRAM PUF is out of scope for the `aethel:core` WIT
-//!   world; this feature exists for research use only, not for production identity
-//!   derivation.
+//! - `puf` (research, non-default): Compiles the `puf` module. SRAM PUF is out of scope
+//!   for the `aethel:core` WIT world and has no WASM export of its own; this feature
+//!   exists for research use only, not for production identity derivation.
 //!
 //! ## Unsafe Code
 //!
@@ -85,12 +87,19 @@ pub mod htss;
 // so its characterisation tests keep pinning the old verifier's defects as
 // running code.
 pub(crate) mod saap;
+
+/// Identity key generation, purpose-separated (context-bound) signing, and
+/// the native `Identity` → PLP projection/proof bridge (A-1).
 pub mod signing;
 
 pub mod credential;
 
 /// Enclave constant-time rejection sampling and CBD η=2 sampler.
 pub mod sampling;
+
+/// `aethel-plp-1` — versioned wire envelope for PLP projections and proofs
+/// (A-4), plus the byte-only [`wire::verify_projection`] entry point.
+pub mod wire;
 
 /// SRAM PUF + BCH(1023,512,55) fuzzy extractor (research, non-default; see the `puf` feature).
 #[cfg(feature = "puf")]
@@ -110,11 +119,31 @@ pub mod component;
 
 // ── Re-exports of public API types ───────────────────────────────────────────
 
-pub use plp::{EphemeralProjection, MasterIdentity, Prover, Verifier, ZkIdentityProof};
 pub use htss::{HypercubeNetwork, NodeAddress, SecretSharer, ZkProofSegment};
-pub use saap::{SaapProof, SaapValidationError};
-pub use sampling::{PlpProof, RejectionError, VectorK};
 pub use identity_error::IdentityError;
+pub use plp::{EphemeralProjection, MasterIdentity, Prover, Verifier, ZkIdentityProof};
+pub use saap::{SaapProof, SaapValidationError};
+
+// `sampling::{PlpProof, RejectionError, VectorK}` is intentionally NOT
+// re-exported at the root as of 0.6.0 (BREAKING — A-4). Those are the
+// enclave sampler's internal types; mixing them into the public verify
+// surface was exactly the "host copies structs / pulls sampling internals"
+// gap A-4 closes. They remain reachable at `aethel_core::sampling::*` for
+// code that genuinely needs the enclave path.
+
+// A-1 / X-2: the native identity surface. `signing::Identity` is the type an
+// agent actually holds (an ML-DSA-65 keypair + PLP seed derived together from
+// one entropy input); `verify` and `verify_with_purpose` are its free-function
+// verification counterparts, needing only public material. See
+// `docs/PURPOSES.md` for the purpose-context registry and
+// `signing::Identity::sign_with_purpose` for how it is used.
+pub use signing::{verify, verify_with_purpose, Identity};
+
+// A-4: the bytes-only verify entry point the gap analysis names —
+// `verify_projection(projection_bytes, proof_bytes, context) -> Result<bool, _>`
+// — decoding `aethel-plp-1` wire envelopes so a caller never touches
+// `sampling` internals or a hand-copied struct layout.
+pub use wire::verify_projection;
 
 // ── Crate-level constants ─────────────────────────────────────────────────────
 

@@ -7,7 +7,7 @@
 //! the same randomness reproduces the same output (so a holder can recompute its
 //! projection without storing it, and the scheme stays testable).
 
-use aethel_core::plp::MasterIdentity;
+use aethel_core::plp::{EphemeralProjection, MasterIdentity};
 
 // Distinct fixed rho per logical session. Real callers MUST sample these
 // freshly; the tests fix them only to be reproducible.
@@ -34,24 +34,37 @@ fn plp_projection_is_fresh_per_rho_and_reproducible_given_rho() {
     let p_a2 = identity.project_at_context(tau, &RHO_A);
     let p_b = identity.project_at_context(tau, &RHO_B);
 
+    // Compare every component of the rank-k vector, not just the first: a
+    // projection that agreed on component 0 and differed elsewhere would pass
+    // a first-component-only check while being a different projection.
+    let b_coeffs = |p: &EphemeralProjection| {
+        p.public_b.iter().flat_map(|q| q.coeffs().to_vec()).collect::<Vec<u32>>()
+    };
+    let a_coeffs = |p: &EphemeralProjection| {
+        p.matrix_a
+            .iter()
+            .flat_map(|row| row.iter().flat_map(|q| q.coeffs().to_vec()))
+            .collect::<Vec<u32>>()
+    };
+
     assert_eq!(
-        p_a1.public_b.coeffs(),
-        p_a2.public_b.coeffs(),
+        b_coeffs(&p_a1),
+        b_coeffs(&p_a2),
         "same rho must reproduce the same projection"
     );
     assert_ne!(
-        p_a1.public_b.coeffs(),
-        p_b.public_b.coeffs(),
+        b_coeffs(&p_a1),
+        b_coeffs(&p_b),
         "different rho must change the projection — e_τ carries per-call entropy"
     );
     assert_eq!(
-        p_a1.matrix_a.coeffs(),
-        p_a2.matrix_a.coeffs(),
+        a_coeffs(&p_a1),
+        a_coeffs(&p_a2),
         "same rho at one τ must reproduce the same context matrix"
     );
     assert_ne!(
-        p_a1.matrix_a.coeffs(),
-        p_b.matrix_a.coeffs(),
+        a_coeffs(&p_a1),
+        a_coeffs(&p_b),
         "different rho at one τ must change A: a shared A is what makes repeated          projection at one τ recover the secret"
     );
     assert_ne!(
@@ -67,9 +80,12 @@ fn plp_projections_are_identity_bound() {
     let tau = b"context-block-height-1000";
     let a = MasterIdentity::from_seed(&[0x01u8; 32]).project_at_context(tau, &RHO_A);
     let b = MasterIdentity::from_seed(&[0x02u8; 32]).project_at_context(tau, &RHO_A);
+    let flat = |p: &EphemeralProjection| {
+        p.public_b.iter().flat_map(|q| q.coeffs().to_vec()).collect::<Vec<u32>>()
+    };
     assert_ne!(
-        a.public_b.coeffs(),
-        b.public_b.coeffs(),
+        flat(&a),
+        flat(&b),
         "distinct identities must not share a projection"
     );
 }

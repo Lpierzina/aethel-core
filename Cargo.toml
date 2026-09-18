@@ -1,6 +1,6 @@
 [package]
 name = "aethel-core"
-version = "0.3.3"
+version = "0.6.0"
 edition = "2021"
 description = "Post-quantum anonymous identity for Rust and WASM. A no_std alternative to static W3C DIDs: per-context identifiers, no reusable public key, zero-knowledge selective disclosure."
 authors = ["Kenneth Harper"]
@@ -39,7 +39,7 @@ serde = { version = "1.0", default-features = false, features = ["alloc", "deriv
 # artifact, adding a language never adds crypto" rule means an SDK cannot carry
 # its own signature library, so aethel-core carries it and exposes it through
 # the WIT world.
-pqc-sig = { version = "0.3", default-features = false }
+pqc-sig = { version = "0.4", default-features = false }
 
 # AEAD for sealing an identity at rest. Sealing lives inside L1 for the same
 # reason signing does: the SDK cannot carry a cipher without breaking "one

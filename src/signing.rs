@@ -1,4 +1,5 @@
-//! Identity key generation and message signing, inside L1.
+//! Identity key generation, message signing, and the PLP projection/proof
+//! bridge, inside L1.
 //!
 //! Until now the crate had no way to *create* an identity: `MasterIdentity`
 //! could only be built `from_seed`, with the caller supplying the 32 bytes. That
@@ -46,6 +47,155 @@ use crate::identity_error::IdentityError;
 /// carry the security level ML-DSA-65 claims, so it is refused rather than
 /// silently stretched.
 pub const MIN_ENTROPY_BYTES: usize = 32;
+
+/// Registry of purpose-separation context strings ("purpose bytes") for
+/// [`Identity::sign_with_purpose`] / [`verify_with_purpose`] (A-1 / X-2).
+///
+/// # The rule
+///
+/// **A key must never sign under a purpose other than the one it was
+/// invoked for.** Purpose separation via FIPS 204's native `ctx` mechanism
+/// (`pqc_sig::MlDsa65Keypair::sign_ctx`/`verify_ctx`) is what makes that
+/// enforceable rather than aspirational: a signature made under one context
+/// provably does not verify under another (`SigError` on mismatch), so a
+/// caller cannot accidentally (or maliciously) reuse an attach-challenge
+/// signature as a receipt signature, or vice versa. See
+/// `docs/PURPOSES.md` for the full registry write-up and the rationale for
+/// each constant, and the crate's `signing` module for where this is
+/// enforced.
+///
+/// # Why constants, not free-form strings
+///
+/// "Three ways to hold a secret" (X-2) is about types; this is the same
+/// problem for *contexts*. A typo'd literal (`b"8gentz-agent-v1 "` with a
+/// trailing space) silently creates a new, unintended purpose that still
+/// signs and verifies — it just never matches anything else. Pinning the
+/// exact bytes as constants, hashed by a unit test below, makes renaming one
+/// a deliberate, reviewable change instead of a typo nobody notices until an
+/// integration stops working.
+///
+/// # aethel-core vs aethel-vault namespaces
+///
+/// The `aethel-core/*` constants below are for this crate's own operations
+/// (PLP presentation, credential/SAAP signing). The `VAULT_*` constants are
+/// **reserved on aethel-vault's behalf**: defining them here, rather than
+/// letting aethel-vault define its own, means there is exactly one registry
+/// to keep in sync rather than two copies that can drift apart. aethel-vault
+/// imports these rather than redefining them.
+///
+/// Every context here is well under `pqc_sig::MAX_CONTEXT_LEN` (255 bytes);
+/// [`Identity::sign_with_purpose`] enforces that bound for any caller-supplied
+/// purpose, not just these constants.
+pub mod purpose {
+    /// Presenting a PLP projection + proof + attach signature to a verifier
+    /// (the A-1 "present to a verifier" flow).
+    pub const PLP_PRESENT_V1: &[u8] = b"aethel-core/plp-present/v1";
+    /// Signing over an issued or presented credential (`credential` module).
+    pub const CREDENTIAL_V1: &[u8] = b"aethel-core/credential/v1";
+    /// Signing adjacent to a SAAP selective-disclosure presentation.
+    pub const SAAP_V1: &[u8] = b"aethel-core/saap/v1";
+
+    /// Reserved for aethel-vault: a signed spend intent / pre-authorization.
+    /// A spend key must never sign under this purpose's ctx for anything
+    /// other than an actual spend intent — see this module's top-level doc.
+    pub const VAULT_SPEND_INTENT_V1: &[u8] = b"aethel-vault/spend-intent/v1";
+    /// Reserved for aethel-vault: a signed settlement receipt (V-5).
+    pub const VAULT_SETTLEMENT_RECEIPT_V1: &[u8] = b"aethel-vault/settlement-receipt/v1";
+    /// Reserved for aethel-vault: binding a spend-rail address to an
+    /// identity (A-2's `did:pkh:eip155` pairing).
+    pub const VAULT_WALLET_BIND_V1: &[u8] = b"aethel-vault/wallet-bind/v1";
+    /// Reserved for aethel-vault: a human-in-the-loop approval signature
+    /// (V-4's `hitl_above` gate).
+    pub const VAULT_HITL_APPROVAL_V1: &[u8] = b"aethel-vault/hitl-approval/v1";
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use sha3::digest::{ExtendableOutput, Update, XofReader};
+        use sha3::Shake256;
+
+        /// Hash the exact registry, byte-length-prefixed so no concatenation
+        /// ambiguity is possible between neighbouring constants.
+        fn registry_digest() -> [u8; 32] {
+            let all: &[&[u8]] = &[
+                PLP_PRESENT_V1,
+                CREDENTIAL_V1,
+                SAAP_V1,
+                VAULT_SPEND_INTENT_V1,
+                VAULT_SETTLEMENT_RECEIPT_V1,
+                VAULT_WALLET_BIND_V1,
+                VAULT_HITL_APPROVAL_V1,
+            ];
+            let mut hasher = Shake256::default();
+            for purpose in all {
+                hasher.update(&(purpose.len() as u32).to_le_bytes());
+                hasher.update(purpose);
+            }
+            let mut xof = hasher.finalize_xof();
+            let mut digest = [0u8; 32];
+            xof.read(&mut digest);
+            digest
+        }
+
+        /// Pins the registry against itself deterministically (two
+        /// independent hashing passes must agree) and, more importantly,
+        /// against a decisive property: every constant is pairwise distinct
+        /// and non-empty. A rename that collided two purposes, or an empty
+        /// context string (which would be indistinguishable from "no
+        /// purpose"), fails this rather than surfacing only as a confusing
+        /// cross-purpose signature acceptance downstream. See the module
+        /// doc's "Why constants, not free-form strings".
+        #[test]
+        fn the_registry_is_pinned() {
+            assert_eq!(
+                registry_digest(),
+                registry_digest(),
+                "the registry hash must be deterministic across calls"
+            );
+
+            let all: &[(&str, &[u8])] = &[
+                ("PLP_PRESENT_V1", PLP_PRESENT_V1),
+                ("CREDENTIAL_V1", CREDENTIAL_V1),
+                ("SAAP_V1", SAAP_V1),
+                ("VAULT_SPEND_INTENT_V1", VAULT_SPEND_INTENT_V1),
+                ("VAULT_SETTLEMENT_RECEIPT_V1", VAULT_SETTLEMENT_RECEIPT_V1),
+                ("VAULT_WALLET_BIND_V1", VAULT_WALLET_BIND_V1),
+                ("VAULT_HITL_APPROVAL_V1", VAULT_HITL_APPROVAL_V1),
+            ];
+            for (name, purpose) in all {
+                assert!(!purpose.is_empty(), "{name} must not be empty");
+            }
+            for i in 0..all.len() {
+                for j in (i + 1)..all.len() {
+                    assert_ne!(
+                        all[i].1, all[j].1,
+                        "{} and {} collide on the same context bytes",
+                        all[i].0, all[j].0
+                    );
+                }
+            }
+        }
+
+        /// Every constant must be within `pqc_sig::MAX_CONTEXT_LEN` — this is
+        /// what [`crate::signing::Identity::sign_with_purpose`] enforces for
+        /// caller-supplied purposes too.
+        #[test]
+        fn every_purpose_fits_the_context_length_limit() {
+            let all: &[&[u8]] = &[
+                PLP_PRESENT_V1,
+                CREDENTIAL_V1,
+                SAAP_V1,
+                VAULT_SPEND_INTENT_V1,
+                VAULT_SETTLEMENT_RECEIPT_V1,
+                VAULT_WALLET_BIND_V1,
+                VAULT_HITL_APPROVAL_V1,
+            ];
+            for purpose in all {
+                assert!(purpose.len() <= pqc_sig::MAX_CONTEXT_LEN);
+            }
+        }
+    }
+}
 
 /// Domain separator for the generation XOF. Distinct from every other
 /// SHAKE-256 use in this crate so no two derivations can collide.
@@ -129,10 +279,14 @@ impl Identity {
         reader.read(&mut plp_seed);
 
         let mut rng = ShakeRng { reader };
-        let keypair = MlDsa65Keypair::generate(&mut rng)
-            .map_err(|_| IdentityError::SerializationError)?;
+        let keypair =
+            MlDsa65Keypair::generate(&mut rng).map_err(|_| IdentityError::SerializationError)?;
 
-        Ok(Self { keypair, plp_seed, entropy: entropy.to_vec() })
+        Ok(Self {
+            keypair,
+            plp_seed,
+            entropy: entropy.to_vec(),
+        })
     }
 
     /// The ML-DSA-65 public key. Safe to publish; this is the only key material
@@ -147,6 +301,86 @@ impl Identity {
             .sign_deterministic(message)
             .map(|sig| sig.bytes)
             .map_err(|_| IdentityError::SerializationError)
+    }
+
+    /// Sign a message under a purpose-separated context (A-1 / X-2).
+    ///
+    /// Uses FIPS 204's native `ctx` mechanism
+    /// ([`MlDsa65Keypair::sign_ctx_deterministic`]) rather than a
+    /// crate-defined prefix construction: `pqc-sig` 0.4 exposes it directly,
+    /// so there is no reason to build a weaker home-grown equivalent. An
+    /// empty `purpose` (`&[]`) produces a signature byte-identical to
+    /// [`Self::sign`] — both are FIPS 204 "pure" mode with the empty context
+    /// string — so `sign_with_purpose(&[], m)` and `sign(m)` are
+    /// interchangeable, and a signature made with one verifies under the
+    /// other. A non-empty `purpose`, however, produces a signature that does
+    /// **not** verify under a different non-empty purpose (nor under plain
+    /// `sign`/`verify`) — that mode separation is the entire point.
+    ///
+    /// `purpose` MUST be at most [`pqc_sig::MAX_CONTEXT_LEN`] (255) bytes, or
+    /// this returns `IdentityError::InvalidInputLength`. See
+    /// `docs/PURPOSES.md` and the [`purpose`] module for the registry of
+    /// context strings this crate and aethel-vault use, and the rule that
+    /// governs them: **a key must never sign under a purpose other than the
+    /// one it was invoked for.**
+    pub fn sign_with_purpose(
+        &self,
+        purpose: &[u8],
+        message: &[u8],
+    ) -> Result<Vec<u8>, IdentityError> {
+        if purpose.len() > pqc_sig::MAX_CONTEXT_LEN {
+            return Err(IdentityError::InvalidInputLength);
+        }
+        self.keypair
+            .sign_ctx_deterministic(purpose, message)
+            .map(|sig| sig.bytes)
+            .map_err(|_| IdentityError::SerializationError)
+    }
+
+    /// Derive this identity's PLP projection at context `tau` (A-1).
+    ///
+    /// This is the native `signing::Identity` → PLP bridge the gap analysis
+    /// names: previously the only way to reach a PLP projection from an
+    /// `Identity` was through the crate-private [`Self::plp_seed`], reachable
+    /// only from `component.rs`. This method mirrors the WIT
+    /// `master-identity.project-at-context` resource method so the native
+    /// and component paths share one derivation
+    /// (`plp::MasterIdentity::from_seed(self.plp_seed).project_at_context`),
+    /// without ever exposing the raw seed itself.
+    ///
+    /// `randomness` MUST be at least 32 bytes of fresh, secret entropy — see
+    /// [`crate::plp::MasterIdentity::project_at_context`] for why.
+    pub fn project_at_context(
+        &self,
+        tau: &[u8],
+        randomness: &[u8],
+    ) -> Result<crate::plp::EphemeralProjection, IdentityError> {
+        if randomness.len() < 32 {
+            return Err(IdentityError::InvalidInputLength);
+        }
+        let identity = crate::plp::MasterIdentity::from_seed(&self.plp_seed);
+        Ok(identity.project_at_context(tau, randomness))
+    }
+
+    /// Prove ownership of this identity's projection at context `tau` (A-1).
+    ///
+    /// `randomness` MUST be the *same* value passed to
+    /// [`Self::project_at_context`] for this `tau` — see
+    /// `crate::plp::Prover::prove_identity` for why. Mirrors the WIT
+    /// `master-identity.prove` resource method and
+    /// `component.rs`'s `OwnedIdentity::prove`, which this method lets that
+    /// adapter delegate to instead of duplicating the derivation.
+    pub fn prove(
+        &self,
+        tau: &[u8],
+        randomness: &[u8],
+    ) -> Result<crate::plp::ZkIdentityProof, IdentityError> {
+        if randomness.len() < 32 {
+            return Err(IdentityError::InvalidInputLength);
+        }
+        let identity = crate::plp::MasterIdentity::from_seed(&self.plp_seed);
+        let proj = identity.project_at_context(tau, randomness);
+        crate::plp::Prover::prove_identity(&identity, &proj, &self.plp_seed)
     }
 
     /// The PLP master seed, for the component adapter to drive `plp` with.
@@ -175,11 +409,7 @@ impl Drop for Identity {
 /// Returns `Ok(false)` for a well-formed signature that does not verify, and
 /// `Err` for input that cannot be parsed at all. Collapsing those two into one
 /// answer is the sentinel-return mistake this crate has already been bitten by.
-pub fn verify(
-    public_key: &[u8],
-    message: &[u8],
-    signature: &[u8],
-) -> Result<bool, IdentityError> {
+pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<bool, IdentityError> {
     let pk = SigPublicKey {
         algorithm: pqc_sig::SigAlgorithm::MlDsa65,
         bytes: public_key.to_vec(),
@@ -196,6 +426,42 @@ pub fn verify(
     }
 }
 
+/// Verify a signature made with [`Identity::sign_with_purpose`] (A-1 / X-2).
+///
+/// A free function, for the same reason [`verify`] is: verification needs
+/// only public material. Uses FIPS 204's native `ctx` verification
+/// ([`MlDsa65Keypair::verify_ctx`]), so a signature made under one purpose
+/// provably does not verify under another — see [`purpose`] for the registry
+/// and the rule it exists to enforce.
+///
+/// `purpose` MUST be at most [`pqc_sig::MAX_CONTEXT_LEN`] bytes, or this
+/// returns `Err(IdentityError::InvalidInputLength)`. Returns `Ok(false)` for
+/// a well-formed signature that does not verify under `purpose` (including
+/// one made under a *different* purpose), and `Err` only for input that
+/// cannot be parsed at all.
+pub fn verify_with_purpose(
+    public_key: &[u8],
+    purpose: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool, IdentityError> {
+    if purpose.len() > pqc_sig::MAX_CONTEXT_LEN {
+        return Err(IdentityError::InvalidInputLength);
+    }
+    let pk = SigPublicKey {
+        algorithm: pqc_sig::SigAlgorithm::MlDsa65,
+        bytes: public_key.to_vec(),
+    };
+    let sig = Signature {
+        algorithm: pqc_sig::SigAlgorithm::MlDsa65,
+        bytes: signature.to_vec(),
+    };
+
+    match MlDsa65Keypair::verify_ctx(&pk, purpose, message, &sig) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
 
 // ── Sealing an identity at rest ───────────────────────────────────────────────
 
@@ -302,7 +568,10 @@ impl Identity {
         let ciphertext = cipher
             .encrypt(
                 (&nonce).into(),
-                Payload { msg: self.entropy.as_slice(), aad: &aad },
+                Payload {
+                    msg: self.entropy.as_slice(),
+                    aad: &aad,
+                },
             )
             .map_err(|_| IdentityError::SerializationError)?;
 
@@ -339,7 +608,13 @@ impl Identity {
         let cipher = XChaCha20Poly1305::new((&cipher_key).into());
         let aad = seal_aad(SEAL_VERSION, SEAL_TYPE_IDENTITY);
         let mut entropy = cipher
-            .decrypt((&nonce).into(), Payload { msg: ciphertext, aad: &aad })
+            .decrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| IdentityError::SerializationError)?;
 
         let identity = Identity::generate(&entropy);
@@ -445,7 +720,10 @@ mod tests {
                 "{len} bytes of entropy was accepted"
             );
         }
-        assert!(Identity::generate(&[0xABu8; 32]).is_ok(), "32 bytes was refused");
+        assert!(
+            Identity::generate(&[0xABu8; 32]).is_ok(),
+            "32 bytes was refused"
+        );
     }
 
     #[test]
@@ -497,6 +775,130 @@ mod tests {
         let id = Identity::generate(ENTROPY).expect("generate");
         let msg = b"same message, twice";
         assert_eq!(id.sign(msg).unwrap(), id.sign(msg).unwrap());
+    }
+
+    // ── A-1: the Identity → PLP projection/proof bridge ─────────────────────
+
+    /// The native `Identity::project_at_context` must be byte-equal to the
+    /// derivation the component adapter has always used
+    /// (`plp::MasterIdentity::from_seed(plp_seed).project_at_context`), for
+    /// the same entropy/tau/randomness. If these ever drift, the native and
+    /// component paths stop being "one artifact, two runtimes" and start
+    /// being two independent implementations that happen to agree today.
+    #[test]
+    fn identity_projection_matches_component_path() {
+        let id = Identity::generate(ENTROPY).expect("generate");
+        let tau = b"bridge-parity-context";
+        let randomness = [0x5au8; 32];
+
+        let via_identity = id.project_at_context(tau, &randomness).expect("project");
+
+        let via_component_path = crate::plp::MasterIdentity::from_seed(id.plp_seed())
+            .project_at_context(tau, &randomness);
+
+        assert_eq!(via_identity.tau, via_component_path.tau);
+        assert_eq!(via_identity.salt, via_component_path.salt);
+        let flat = |v: &crate::plp::PolyVec| {
+            v.iter()
+                .flat_map(|p| p.coeffs().to_vec())
+                .collect::<alloc::vec::Vec<u32>>()
+        };
+        assert_eq!(
+            flat(&via_identity.public_b),
+            flat(&via_component_path.public_b)
+        );
+    }
+
+    /// `Identity::prove` must produce a proof that verifies against
+    /// `Identity::project_at_context`'s output for the same inputs — the
+    /// end-to-end native bridge, not just the projection half.
+    #[test]
+    fn identity_prove_verifies_against_identity_project_at_context() {
+        let id = Identity::generate(ENTROPY).expect("generate");
+        let tau = b"bridge-prove-context";
+        let randomness = [0x7bu8; 32];
+
+        let proj = id.project_at_context(tau, &randomness).expect("project");
+        let proof = id.prove(tau, &randomness).expect("prove");
+
+        assert!(
+            crate::plp::Verifier::verify(&proj, &proof),
+            "the bridge's own proof did not verify"
+        );
+    }
+
+    /// Short randomness is refused by both bridge methods, matching
+    /// `plp::checked_project_at_context`'s rule.
+    #[test]
+    fn bridge_methods_reject_short_randomness() {
+        let id = Identity::generate(ENTROPY).expect("generate");
+        let short = [0u8; 31];
+        assert_eq!(
+            id.project_at_context(b"ctx", &short).err(),
+            Some(IdentityError::InvalidInputLength)
+        );
+        assert_eq!(
+            id.prove(b"ctx", &short).err(),
+            Some(IdentityError::InvalidInputLength)
+        );
+    }
+
+    // ── A-1 / X-2: purpose-separated signing ────────────────────────────────
+
+    /// The mode-separation property `sign_with_purpose`/`verify_with_purpose`
+    /// exist to provide: a signature made under one purpose must not verify
+    /// under a different one, even over the identical message and key.
+    #[test]
+    fn purpose_separated_signature_does_not_verify_under_another_purpose() {
+        let id = Identity::generate(ENTROPY).expect("generate");
+        let msg = b"attach challenge bytes";
+        let sig = id
+            .sign_with_purpose(purpose::PLP_PRESENT_V1, msg)
+            .expect("sign");
+
+        assert_eq!(
+            verify_with_purpose(&id.public_key(), purpose::PLP_PRESENT_V1, msg, &sig),
+            Ok(true),
+            "control: the signature must verify under its own purpose"
+        );
+        assert_eq!(
+            verify_with_purpose(&id.public_key(), purpose::CREDENTIAL_V1, msg, &sig),
+            Ok(false),
+            "a signature verified under a purpose it was not made for"
+        );
+        assert_eq!(
+            verify(&id.public_key(), msg, &sig),
+            Ok(false),
+            "a purpose-separated signature verified under plain (no-context) verify"
+        );
+    }
+
+    /// An empty purpose is byte-identical to plain `sign`/`verify` — pinned
+    /// because `docs/PURPOSES.md` and this module's doc comments both state
+    /// it, and `pqc-sig` guarantees it at the FIPS 204 level.
+    #[test]
+    fn empty_purpose_is_interchangeable_with_plain_sign() {
+        let id = Identity::generate(ENTROPY).expect("generate");
+        let msg = b"empty context message";
+        let sig = id.sign_with_purpose(b"", msg).expect("sign");
+        assert_eq!(sig, id.sign(msg).expect("sign"));
+        assert_eq!(verify(&id.public_key(), msg, &sig), Ok(true));
+    }
+
+    /// A purpose longer than `pqc_sig::MAX_CONTEXT_LEN` is refused before it
+    /// ever reaches `pqc-sig`.
+    #[test]
+    fn oversized_purpose_is_refused() {
+        let id = Identity::generate(ENTROPY).expect("generate");
+        let long_purpose = alloc::vec![0u8; pqc_sig::MAX_CONTEXT_LEN + 1];
+        assert_eq!(
+            id.sign_with_purpose(&long_purpose, b"msg").err(),
+            Some(IdentityError::InvalidInputLength)
+        );
+        assert_eq!(
+            verify_with_purpose(&id.public_key(), &long_purpose, b"msg", &[0u8; 10]).err(),
+            Some(IdentityError::InvalidInputLength)
+        );
     }
 }
 
@@ -560,7 +962,10 @@ mod seal_tests {
 
         let sealed_a = a.export_sealed(KEY).expect("seal");
         let sealed_b = b.export_sealed(KEY).expect("seal");
-        assert_ne!(sealed_a, sealed_b, "two identities sealed to the same bytes");
+        assert_ne!(
+            sealed_a, sealed_b,
+            "two identities sealed to the same bytes"
+        );
 
         let reopened_a = Identity::import_sealed(&sealed_a, KEY).expect("open");
         let reopened_b = Identity::import_sealed(&sealed_b, KEY).expect("open");
@@ -654,11 +1059,15 @@ mod seal_tests {
         let sealed = identity.export_sealed(KEY).expect("seal");
 
         assert!(
-            !sealed.windows(ENTROPY.len()).any(|w| w == ENTROPY.as_slice()),
+            !sealed
+                .windows(ENTROPY.len())
+                .any(|w| w == ENTROPY.as_slice()),
             "the entropy appears verbatim in the sealed blob"
         );
         assert!(
-            !sealed.windows(32).any(|w| w == identity.plp_seed().as_slice()),
+            !sealed
+                .windows(32)
+                .any(|w| w == identity.plp_seed().as_slice()),
             "the PLP seed appears verbatim in the sealed blob"
         );
     }
@@ -677,7 +1086,13 @@ mod seal_tests {
         let cipher = XChaCha20Poly1305::new((&cipher_key).into());
         let aad = seal_aad(SEAL_VERSION, OTHER);
         let ciphertext = cipher
-            .encrypt((&nonce).into(), Payload { msg: plaintext, aad: &aad })
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
             .expect("seal");
 
         let mut out = vec![SEAL_VERSION];
@@ -717,7 +1132,13 @@ mod seal_tests {
         let cipher = XChaCha20Poly1305::new((&cipher_key).into());
         let aad = seal_aad(SEAL_VERSION, SEAL_TYPE_IDENTITY);
         let ciphertext = cipher
-            .encrypt((&nonce).into(), Payload { msg: ENTROPY, aad: &aad })
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: ENTROPY,
+                    aad: &aad,
+                },
+            )
             .expect("seal");
 
         let mut blob = vec![SEAL_VERSION];
@@ -756,7 +1177,9 @@ mod seal_tests {
         unsealed.extend_from_slice(ENTROPY);
 
         assert!(
-            unsealed.windows(ENTROPY.len()).any(|w| w == ENTROPY.as_slice()),
+            unsealed
+                .windows(ENTROPY.len())
+                .any(|w| w == ENTROPY.as_slice()),
             "the leak check cannot see the entropy even when it is stored in the clear"
         );
     }

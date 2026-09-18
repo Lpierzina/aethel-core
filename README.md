@@ -5,6 +5,18 @@
 
 > ⚠️ **Security Notice**: This is a pre-release implementation. Do not use in production without a formal security audit.
 
+## PLP in one paragraph
+
+An agent holds one [`signing::Identity`](src/signing.rs) (sealed at rest, never persisted
+in the clear). To present to a verifier: derive a one-time PLP projection for the
+verifier's context, prove ownership of it, sign the verifier's attach challenge under a
+purpose-separated context (`docs/PURPOSES.md`), and hand over bytes —
+[`wire::encode_projection`](src/wire.rs)/[`encode_proof`](src/wire.rs) output. The verifier
+holds no secret at all: it calls [`wire::verify_projection`](src/wire.rs) and
+`verify_with_purpose` on nothing but those bytes. See
+[`examples/present_to_verifier.rs`](examples/present_to_verifier.rs) for the whole flow in
+under 40 lines, and run it with `cargo run --example present_to_verifier`.
+
 `aethel-core` is a `no_std`-compatible Rust library
 implementing three post-quantum identity primitives, compiled natively or to
 `wasm32-unknown-unknown`:
@@ -12,9 +24,15 @@ implementing three post-quantum identity primitives, compiled natively or to
 - **Polymorphic Lattice Projection (PLP)** — context-bound ephemeral identity projection and
   ZK ownership proof over Module-LWE (M-LWE).
 - **Selective Attribute Attestation Protocol (SAAP)** — BDLOP vector commitment with
-  zero-knowledge selective disclosure and norm-bound verification.
-- **5D Hypercube Threshold Secret Sharing (HTSS)** — Shamir 3-of-5 secret sharing routed over
-  a Q_5 hypercube graph (32 nodes, 80 edges).
+  selective disclosure and norm-bound verification. The commitment does not currently
+  provide the hiding property the design calls for; see
+  [`SECURITY.md`](./SECURITY.md#known-limitations) before relying on undisclosed
+  attributes staying undisclosed.
+- **Threshold secret sharing (Shamir 3-of-5) for identity backup** — a ritual the agent's
+  principal or an operator runs over a sealed identity's key material, routed (as a local
+  model, not a running network) over a Q_5 hypercube graph (32 nodes, 80 edges). This is
+  **not** a hosted service — 8gentz does not run the 32-node cube; see
+  [`docs/HTSS-TOPOLOGY.md`](docs/HTSS-TOPOLOGY.md#who-runs-htss-a-3).
 
 ## What runs today vs. what is designed
 
@@ -23,8 +41,12 @@ integration tests + 1 doctest, all passing on default features):
 
 - `plp` — key derivation (`MasterIdentity::from_seed`), context projection
   (`project_at_context`), ZK proof generation and verification (`Prover`, `Verifier`)
-- `saap` — selective-disclosure proof generation and verification (`saap_prove`,
-  `verify_saap_proof`)
+- `credential` — BDLOP credential issuance and blinding (`Credential::issue`,
+  `BlindedCredential::new`) and the linked selective-disclosure proof (`credential::prove`,
+  exported as `saap-verify-presentation`). **The commitment does not hide**: see `SECURITY.md`
+  and `docs/DEVIATIONS.md` D-01
+- `saap` — crate-internal primitives the credential module builds on. The single-response
+  `saap_prove`/`verify_saap_proof` pathway was retired from the WIT world in 0.1.5 (D-13)
 - `htss` — 3-of-5 threshold secret splitting and reconstruction, hypercube routing
 - `sampling` — constant-time rejection sampling, CBD η=2 sampler, norm checking
 - `ct_verify` — a Valgrind/ctgrind constant-time verification harness (doctest-covered)
@@ -56,25 +78,43 @@ integration tests + 1 doctest, all passing on default features):
 |-----------|-------|
 | Ring | `R_q = Z_q[X]/(X^256 + 1)` |
 | Modulus `q` | `8,380,417` |
-| Module rank `k` | 4 |
+| Module rank `k` | 4 (`plp::MODULE_K`) |
 | Noise `η` | 2 (Centered Binomial Distribution) |
 | Masking bound `γ₁` | 131,072 (2^17) |
-| Rejection bound `β` | 78 |
-| Fixed iteration ceiling | 16 |
-| PLP domain separator | `"AETHEL_PLP_CTX_V1"` |
-| SAAP domain separator | `"AETHEL_SAAP_CHALLENGE_V1"` |
+| Challenge weight | 39 non-zero coefficients in `{±1}` (`plp::CHALLENGE_WEIGHT`) |
+| Rejection bound `β` | 78, which is `39 × 2` and is checked against the challenge weight at compile time |
+| Rejection ceiling | 48 for an identity proof, 192 for a credential presentation |
+| PLP matrix domain separator | `"AETHEL_PLP_CTX_V3"` |
+| PLP challenge domain separator | `"AETHEL_PLP_CHALLENGE_V4"` |
+| SAAP challenge domain separator | `"AETHEL_SAAP_CHALLENGE_V3"` |
 
 ## Modules
 
 | Module | Description | Status |
 |--------|-------------|--------|
 | `plp` | Polymorphic Lattice Projection — context-bound ephemeral identity projection over M-LWE | Default |
+| `signing` | Identity key generation, purpose-separated signing (`sign_with_purpose`/`verify_with_purpose`), and the native `Identity` → PLP projection/proof bridge | Default |
+| `wire` | `aethel-plp-1` versioned wire envelope + `verify_projection(bytes, bytes, bytes) -> Result<bool, _>` | Default |
 | `saap` | Selective Attribute Attestation Protocol — BDLOP commitment + ZK selective disclosure | Default |
-| `htss` | 5D Hypercube Threshold Secret Sharing — Shamir 3-of-5 over F_q with Q_5 routing | Default |
+| `credential` | Issuer-authenticated credential issuance/presentation, superseding `saap`'s public surface | Default |
+| `htss` | Threshold secret sharing (Shamir 3-of-5) for identity backup, modeled over a Q_5 routing graph — a principal/operator ritual, not a hosted service | Default |
 | `sampling` | Constant-time rejection sampling — 16-iteration fixed loop, CMOV, zeroization | Default |
 | `ct_verify` | Constant-time verification harness | Default |
 | `identity_error` | Mirror of the WIT `identity-error` variant, plus checked wrappers | Default |
 | `puf` | SRAM PUF fuzzy extractor — BCH(1023,512,55) over GF(2^10), research code | Non-default (`puf` feature) |
+
+### Which type do I hold? (X-2)
+
+| Role | Type | Notes |
+|---|---|---|
+| **Agent** | one [`signing::Identity`](src/signing.rs) | Sealed at rest (`export_sealed`/`import_sealed`). Holds an ML-DSA-65 keypair and a PLP master seed together. |
+| **Verifier** | nothing — bytes only | Calls `verify`/`verify_with_purpose`/`wire::verify_projection`. No secret of any kind. |
+| **Internal derivation** | [`plp::MasterIdentity`](src/plp.rs) | Derived from an `Identity`'s seed on demand; prefer `Identity` in application code. |
+| **aethel-vault** (separate crate) | a settlement signer key, and — `fhe-state` mode only — a TFHE key pair | Neither leaves the agent; consumes this crate for identity, purpose bytes, and `verify_projection`. |
+
+See [`docs/PURPOSES.md`](docs/PURPOSES.md) for the full purpose-bytes registry
+(`signing::purpose`) and the domain-separation rule it enforces, and
+[`docs/WIRE-FORMAT.md`](docs/WIRE-FORMAT.md) for the `aethel-plp-1` wire codec.
 
 ## Feature Flags
 
@@ -159,14 +199,22 @@ artifact was not built from this source.
 | `plp-project-at-context` | Implemented |
 | `plp-prove-identity` | Implemented |
 | `plp-verify` | Implemented |
+| `plp-verify-bytes` | Implemented (A-4 — verify from `aethel-plp-1` wire bytes, binding the verifier's own context) |
+| `encode-projection` | Implemented (A-4 — typed record to `aethel-plp-1` bytes) |
+| `encode-proof` | Implemented (A-4) |
 | `saap-verify-presentation` | Implemented |
+| `issuer-public-parameters` | Implemented |
 | `verify-signature` | Implemented |
 | `htss-split` | Implemented (fixed internal nonce, see `src/component.rs`) |
 | `htss-reconstruct` | Implemented |
 
 Selective disclosure runs through the `credential` resource (`issue` / `present`) and
 `saap-verify-presentation`, anchored on the PLP projection `b_τ = A_τ·s + e_τ`, whose noise is
-what makes it publishable. An earlier `attestation` interface exported a narrower
+what makes it publishable. Issuing and verifying take opposite halves of the issuer's key
+pair: `issue` takes the issuer seed, `saap-verify-presentation` takes the
+`issuer-public-parameters` derived from it, so a verifier holds no secret and issuer and
+verifier can be separate parties. What those parameters do and do not vouch for is stated on
+the type in the WIT, and at length in [`docs/ISSUER-AUTHENTICATION.md`](docs/ISSUER-AUTHENTICATION.md). An earlier `attestation` interface exported a narrower
 `saap-prove` / `saap-verify` pair whose verify half could only ever deny — it needed a public
 key `t = A_τ·sk` that its signature could not carry and that, having no error term, was an
 exact linear image of the secret. That interface was removed in 0.1.5 rather than kept as a
@@ -175,6 +223,19 @@ surface that could never succeed.
 This is the only WebAssembly artifact. The `wasm-bindgen` core module that used to sit
 alongside it was retired in 0.1.5: two surfaces contradicted the one-artifact rule, and the
 untyped one signalled failure with sentinel values instead of `result<T, identity-error>`.
+
+## Target matrix (X-3)
+
+| Role | Target | Artifact | Status |
+|---|---|---|---|
+| sagp-host / native verifier | native rlib, `x86_64`/`aarch64` | `aethel-core` crate, `wire::verify_projection` | Supported, tested (`cargo test`) |
+| Agent SDK | `wasm32-unknown-unknown` component | `aethel_core.component.wasm` (`--features component`) | Supported, tested (`cargo test --features component-tests`) |
+| Inner worker | `wasm32-wasip2` | — | Not built today. The `wasm32-wasip2` Rust target exists and this crate's default-feature code builds under it, but no CI job or shipped artifact targets it; treat as "to decide" per the gap-remediation plan, not as a supported target. |
+
+Add `aethel-vault` to the ["Shared WASM Modules"](#shared-wasm-modules) table below: it
+consumes this crate for identity, purpose bytes, and `verify_projection`, and is a
+*research* module in the same sense the others there are — see that crate's own README for
+its target matrix and production/research status.
 
 ## Building
 
@@ -206,6 +267,11 @@ cargo test --features puf
 
 ## Integration Example (Rust)
 
+The full "load an identity, present to a verifier, verify from bytes" flow lives in
+[`examples/present_to_verifier.rs`](examples/present_to_verifier.rs) (run with
+`cargo run --example present_to_verifier`) — see [PLP in one paragraph](#plp-in-one-paragraph)
+above. The lower-level struct API it is built on:
+
 ```rust
 use aethel_core::plp::{MasterIdentity, Prover, Verifier};
 
@@ -232,12 +298,24 @@ let proof = Prover::prove_identity(&identity, &projection, &seed)
 assert!(Verifier::verify(&projection, &proof));
 ```
 
+Most application code should prefer [`signing::Identity`](src/signing.rs)'s
+`project_at_context`/`prove` over calling `plp::MasterIdentity` directly — see
+["Which type do I hold?"](#which-type-do-i-hold-x-2).
+
 ## Security Properties
 
 - **Post-quantum secure**: Based on Module Learning With Errors (M-LWE), conjectured secure against quantum adversaries
 - **Ephemeral identifiers**: Each context `τ` produces a mathematically independent projection — no linkability across contexts
 - **Constant-time**: All secret-dependent operations use fixed-iteration loops and CMOV selection
 - **No traditional crypto**: Zero AES, RSA, ECDSA, or classical elliptic curve operations
+- **PLP is an identity, not an address. Spend rails stay `eip155`.** A PLP projection is
+  never encoded as, hashed into, or substituted for a Base address; USDC settlement is a
+  separate dialect this crate has no notion of. See
+  [`docs/PLP-ALGORITHM.md` §9](docs/PLP-ALGORITHM.md#9-plp-vs-didpkheip155--two-dialects-not-two-competitors-a-2).
+- **A key signs under one purpose only.** `signing::Identity::sign_with_purpose`/`verify_with_purpose`
+  use FIPS 204's native context mechanism, so a signature made for one purpose (attach
+  challenge, receipt, HITL approval, ...) provably does not verify under another. See
+  [`docs/PURPOSES.md`](docs/PURPOSES.md).
 - **Offline generation**: Identity generation (`plp` key derivation, context projection, proof generation — the `--lib` unit tests plus `tests/plp_tests.rs`) never requires network access, and this is proven by denying the capability at the boundary rather than by trusting application code to report it honestly. CI's `offline-generation` job (`.github/workflows/ci.yml`) runs that generation test suite inside a network namespace with no interface, and in the same isolated step runs a negative-control test (`tests/network_isolation_negative_control.rs`) that deliberately makes a real network call — that control is *expected to fail* there, and its failure is what proves the isolation is real. If you don't trust this claim, don't take it on faith: read `offline-generation` in the Actions tab, or reproduce it locally (Linux/WSL2) with `unshare --net --map-root-user -- cargo test --offline --lib --test plp_tests`.
 
 ## Unsafe Code
@@ -264,12 +342,13 @@ aethel-core is one of several independently-versioned repositories intended to r
 each other as WASM modules loaded by a wasmer.io host. These are separate repos with their own
 build and test suites — this README makes no claims about their state:
 
-| Module | Purpose |
-|--------|---------|
-| `pqc-kem` | ML-KEM (FIPS 203) key encapsulation |
-| `pqc-sig` | ML-DSA (FIPS 204) signatures |
-| `privacy` | ε-Differential Privacy noise injection |
-| `obfuscation` | WASM binary hardening |
+| Module | Purpose | Relationship to aethel-core | Production / research |
+|--------|---------|---|---|
+| `pqc-kem` | ML-KEM (FIPS 203) key encapsulation | Sibling module, not a dependency | Research |
+| `pqc-sig` | ML-DSA (FIPS 204) signatures | **Direct dependency** — `signing::Identity` is built on `pqc_sig::MlDsa65Keypair` | Research |
+| `privacy` | ε-Differential Privacy noise injection | Sibling module, not a dependency | Research |
+| `obfuscation` | WASM binary hardening | Sibling module, not a dependency | Research |
+| `aethel-vault` (repo `aethel-runtime`) | Agent-held wallet: settlement signing, spend policy, receipts | **Consumes this crate** — identity, `signing::purpose` constants, `wire::verify_projection` | Research; see that crate's own README for its target matrix and custody rules |
 
 ## Continuous Integration
 
@@ -292,12 +371,16 @@ Three jobs:
 
 ## Further Documentation
 
-[`docs/`](./docs/) has deeper algorithm write-ups: [`PLP-ALGORITHM.md`](./docs/PLP-ALGORITHM.md),
-[`SAAP-SPEC.md`](./docs/SAAP-SPEC.md), [`HTSS-TOPOLOGY.md`](./docs/HTSS-TOPOLOGY.md),
-[`SRAM-PUF.md`](./docs/SRAM-PUF.md), and [`OVERVIEW.md`](./docs/OVERVIEW.md). Each was reviewed
-against this README (P3-05, 2026-08-26) and carries inline markers wherever it describes a
-credential-issuance layer, hardware target, or parameter level that isn't actually shipped —
-read the editorial note at the top of each file first.
+[`docs/`](./docs/) has deeper algorithm write-ups: [`PLP-ALGORITHM.md`](./docs/PLP-ALGORITHM.md)
+(§9 covers PLP vs `did:pkh:eip155`), [`SAAP-SPEC.md`](./docs/SAAP-SPEC.md),
+[`HTSS-TOPOLOGY.md`](./docs/HTSS-TOPOLOGY.md) ("Who runs HTSS" section),
+[`SRAM-PUF.md`](./docs/SRAM-PUF.md), [`OVERVIEW.md`](./docs/OVERVIEW.md),
+[`PURPOSES.md`](./docs/PURPOSES.md) (the purpose-bytes registry, A-1/X-2), and
+[`WIRE-FORMAT.md`](./docs/WIRE-FORMAT.md) (the normative `aethel-plp-1` wire codec, A-4).
+Each of the pre-existing files was reviewed against this README (P3-05, 2026-08-26) and
+carries inline markers wherever it describes a credential-issuance layer, hardware target,
+or parameter level that isn't actually shipped — read the editorial note at the top of each
+file first.
 
 ## Contributing
 
