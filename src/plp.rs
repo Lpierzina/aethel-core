@@ -309,11 +309,6 @@ fn sub_mod(a: u32, b: u32) -> u32 {
     }
 }
 
-#[inline(always)]
-fn mul_mod(a: u32, b: u32) -> u32 {
-    ((a as u64 * b as u64) % Q as u64) as u32
-}
-
 // ── NTT implementation ────────────────────────────────────────────────────────
 //
 // We use a simple schoolbook NTT for correctness. The twiddle factors are

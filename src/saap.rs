@@ -118,6 +118,7 @@ pub struct SaapProof {
 }
 
 impl SaapProof {
+    /// Create an all-zero proof transcript.
     pub const fn zero() -> Self {
         Self {
             context_tag: [0u8; 32],
@@ -134,8 +135,11 @@ impl SaapProof {
 /// Typed verification failure reasons.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SaapValidationError {
+    /// The response exceeds the protocol's permitted infinity norm.
     NormBoundViolation,
+    /// The supplied Fiat-Shamir challenge does not match the transcript.
     ChallengeMismatch,
+    /// The commitment verification equation does not hold.
     InvalidAttributeCommitment,
 }
 

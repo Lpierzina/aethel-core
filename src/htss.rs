@@ -136,11 +136,17 @@ pub struct ZkProofSegment {
 /// A routed packet carrying one proof segment through the hypercube.
 #[derive(Clone, Debug)]
 pub struct HypercubePacket {
+    /// Node where this packet entered the network.
     pub source: NodeAddress,
+    /// Node to which this packet is being routed.
     pub destination: NodeAddress,
+    /// Node currently holding the packet.
     pub current_node: NodeAddress,
+    /// Ordered hypercube dimensions traversed by this route.
     pub dimension_route: Vec<usize>,
+    /// Index of the next dimension to traverse in `dimension_route`.
     pub route_index: usize,
+    /// Authenticated share carried by the packet.
     pub payload: ZkProofSegment,
 }
 
@@ -935,6 +941,7 @@ impl SecretSharer {
 
 /// 32-node Q_5 hypercube network with dimension-disjoint routing.
 pub struct HypercubeNetwork {
+    /// Addresses of all nodes in the Q_5 network.
     pub nodes: Vec<NodeAddress>,
 }
 
