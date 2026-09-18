@@ -1142,6 +1142,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Characterizes the deliberately retained legacy API.
     fn test_htss_split_reconstruct() {
         let secret: u64 = 5234123;
         let seed: u64 = 0xdeadbeef_cafebabe;
@@ -1154,6 +1155,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Characterizes the deliberately retained legacy API.
     fn test_hypercube_routing() {
         let network = HypercubeNetwork::new();
         let src = NodeAddress(0b00000);

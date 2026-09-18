@@ -387,6 +387,7 @@ impl Identity {
     ///
     /// Deliberately `pub(crate)`: this is private key material, and the whole
     /// point of holding it here is that it has no route across the WIT boundary.
+    #[cfg(any(feature = "component", test))]
     pub(crate) fn plp_seed(&self) -> &[u8; 32] {
         &self.plp_seed
     }
