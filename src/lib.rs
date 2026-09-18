@@ -68,10 +68,6 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-// Import alloc types needed for WASM exports
-#[cfg(feature = "wasm")]
-use alloc::vec::Vec;
-
 // ── Module declarations ──────────────────────────────────────────────────────
 
 /// Polymorphic Lattice Projection (PLP) engine.
@@ -86,6 +82,7 @@ pub mod htss;
 // about never putting on the wire (P3-10 / 0X3-78). Retained crate-internally
 // so its characterisation tests keep pinning the old verifier's defects as
 // running code.
+#[allow(dead_code)]
 pub(crate) mod saap;
 
 /// Identity key generation, purpose-separated (context-bound) signing, and

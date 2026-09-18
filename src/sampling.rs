@@ -43,22 +43,31 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 use sha3::{Shake256, digest::{Update, ExtendableOutput, XofReader}};
 
+/// Degree of polynomials in the cyclotomic ring.
 pub const RING_N: usize = 256;
+/// Number of polynomials in an LWE module vector.
 pub const MODULE_K: usize = 4;
+/// Prime modulus of the polynomial coefficient ring.
 pub const PARAM_Q: i32 = 8_380_417;
+/// Upper bound of the uniform masking distribution.
 pub const PARAM_GAMMA1: i32 = 131_072;
+/// Rejection-sampling slack subtracted from [`PARAM_GAMMA1`].
 pub const PARAM_BETA: i32 = 78;
+/// Strict infinity-norm bound accepted for a response.
 pub const REJECTION_BOUND: i32 = PARAM_GAMMA1 - PARAM_BETA;
+/// Number of padded rejection-sampling attempts.
 pub const FIXED_ITERATION_CEILING: usize = 16;
 
 /// Cache-line-aligned polynomial in R_q.
 #[derive(Copy, Clone)]
 #[repr(align(64))]
 pub struct Polynomial {
+    /// Centered coefficients of the ring polynomial.
     pub coeffs: [i32; RING_N],
 }
 
 impl Polynomial {
+    /// Create the additive identity polynomial.
     pub const fn zero() -> Self {
         Self { coeffs: [0i32; RING_N] }
     }
@@ -68,10 +77,12 @@ impl Polynomial {
 #[derive(Copy, Clone)]
 #[repr(align(64))]
 pub struct VectorK {
+    /// Polynomial components of this module vector.
     pub vec: [Polynomial; MODULE_K],
 }
 
 impl VectorK {
+    /// Create the additive identity vector.
     pub const fn zero() -> Self {
         Self { vec: [Polynomial { coeffs: [0i32; RING_N] }; MODULE_K] }
     }
@@ -81,11 +92,14 @@ impl VectorK {
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct PlpProof {
+    /// Response vector selected by rejection sampling.
     pub z: VectorK,
+    /// Zero-based attempt that produced `z`.
     pub iteration_counter: u32,
 }
 
 impl PlpProof {
+    /// Create an empty proof value.
     pub const fn zero() -> Self {
         Self {
             z: VectorK { vec: [Polynomial { coeffs: [0; RING_N] }; MODULE_K] },
@@ -247,6 +261,7 @@ pub fn enclave_plp_prove_fixed_time(
 /// Error type for exhausted iteration ceiling.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RejectionError {
+    /// No candidate satisfied the response norm within the fixed ceiling.
     AllIterationsRejected,
 }
 
@@ -446,6 +461,7 @@ pub const Q_MODULUS: i32 = 8_380_417;
 /// documented now so it's correct and available the moment something uses it.
 #[derive(Copy, Clone)]
 pub struct PolyRq {
+    /// Centered coefficients of the ring polynomial.
     pub coeffs: [i32; N_DEGREE],
 }
 

@@ -44,6 +44,10 @@
 //! reachable through the WIT world any more.
 
 #![allow(clippy::needless_range_loop)]
+// `wit_bindgen::generate!` defines the public bindings consumed by the component
+// ABI. Those generated items do not carry Rustdoc, while this module documents
+// the hand-written boundary implementation.
+#![allow(missing_docs)]
 
 extern crate alloc;
 
